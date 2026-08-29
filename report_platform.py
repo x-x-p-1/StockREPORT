@@ -283,6 +283,22 @@ def render_line_chart(df, ycols, title, unit='%'):
     st.plotly_chart(fig, width='stretch')
 
 
+def render_radar(scores):
+    """因子强度雷达图(0-100)"""
+    dims = list(scores.keys())
+    if not dims:
+        return
+    vals = [float(scores[d]) for d in dims] + [float(scores[dims[0]])]
+    fig = go.Figure(go.Scatterpolar(r=vals, theta=dims + [dims[0]], fill='toself',
+                                    line=dict(color='#457b9d'),
+                                    marker=dict(color='#457b9d')))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                      showlegend=False, height=400,
+                      title='因子强度雷达 Factor Radar（0-100）',
+                      margin=dict(l=40, r=40, t=60, b=20))
+    st.plotly_chart(fig, width='stretch')
+
+
 # ========== 侧边栏 ==========
 with st.sidebar:
     st.title(APP_TITLE)
@@ -306,10 +322,11 @@ if err or not ths:
 st.title(f'{name}  ({ths})')
 st.caption(f'更新于 {qr.datetime.now():%Y-%m-%d %H:%M}')
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     '📋 总览 Overview', '📈 利润表 Income Statement',
     '📊 资产负债表 Balance Sheet', '💵 现金流量表 Cash Flow',
     '🧩 概念板块 Concept Boards', '📰 券商研报 Research',
+    '🧬 因子画像 Factor Profile',
 ])
 
 # ---------- Tab1 总览 Overview ----------
@@ -529,3 +546,63 @@ with tab6:
                     st.error('下载失败')
         else:
             st.caption('（无 PDF 链接）')
+
+# ---------- Tab7 因子画像（大师关注点 → A股因子 总结） ----------
+with tab7:
+    st.subheader('因子画像 Factor Profile（大师关注点 → A股因子）')
+    st.caption('把巴菲特/格雷厄姆/林奇/费雪关注的指标提炼为 A 股口径可计算因子；'
+               '因子=连续画像（强弱），非买卖结论')
+    flimit = max(limit, 16)
+    inc = ((cached_statement(ths, 'income', flimit).get('data') or {}).get('item', []))
+    bal = ((cached_statement(ths, 'balance', flimit).get('data') or {}).get('item', []))
+    csh = ((cached_statement(ths, 'cashflow', flimit).get('data') or {}).get('item', []))
+    val = cached_valuations(ths)
+    # 同业参照: 用第一个精准概念板块的成分股中位数(需 pe/pb)
+    peer = None
+    boards = cached_concept_boards(ticker)
+    if boards:
+        pc = sorted(boards, key=lambda b: 0 if b.get('precise') == '1' else 1)[0]
+        stocks = cached_board_stocks(pc['code'])
+        pes = sorted(s['pe'] for s in stocks
+                     if isinstance(s.get('pe'), (int, float)) and s['pe'] and s['pe'] > 0)
+        pbs = sorted(s['pb'] for s in stocks
+                     if isinstance(s.get('pb'), (int, float)) and s['pb'] and s['pb'] > 0)
+        if pes and pbs:
+            peer = {'name': pc['name'], 'n': len(pes),
+                    'pe_median': round(pes[len(pes) // 2], 1),
+                    'pb_median': round(pbs[len(pbs) // 2], 1)}
+    prof = qr.build_factor_profile(inc, bal, csh, val, peer)
+
+    render_radar(prof['radar'])
+    st.divider()
+
+    # 因子卡片
+    _RC = {'积极': '🟢', '中性': '🟡', '偏弱': '🔴', '数据不足': '⚪'}
+    for f in prof['factors']:
+        with st.expander(f"{_RC.get(f['rating'], '')} {f['name']} {f['en']}  →  {f['value']}",
+                         expanded=(f['key'] in ('roe', 'peg', 'debt'))):
+            st.markdown(f"**{f['value']}** · {f['detail']}")
+            st.caption(f"🧭 关注来源：{f['source']} ｜ 为什么看它：{f['why']}")
+    st.divider()
+
+    # 营收×净利矩阵 + 风险扫描
+    m = prof['matrix']
+    st.markdown('**营收×净利矩阵（年报同比）** 营收 '
+                f"{qr.fmt_pct(m.get('rev')) if m.get('rev') is not None else '-'}"
+                ' × 净利 '
+                f"{qr.fmt_pct(m.get('np')) if m.get('np') is not None else '-'}")
+    risk = prof['risk']
+    if risk:
+        st.warning('⚠️ 风险点：' + '；'.join(risk))
+    else:
+        st.success('未发现明显风险点')
+
+    # 同业参照
+    p = prof['peer']
+    if p and p.get('n'):
+        st.markdown(f"**同业参照**：同板块 **{p.get('name', '')}**（{p['n']} 家）"
+                    f"PE 中位 {p.get('pe_med')} vs 本股 {p.get('pe_stock')}"
+                    f"（{qr.fmt_pct(p.get('pe_vs')) if p.get('pe_vs') is not None else '-'}）"
+                    f" · PB 中位 {p.get('pb_med')} vs 本股 {p.get('pb_stock')}"
+                    f"（{qr.fmt_pct(p.get('pb_vs')) if p.get('pb_vs') is not None else '-'}）")
+    st.caption('数据源：同花顺三表/估值 + 东财概念成分股 · 仅供研究参考，非投资建议')
