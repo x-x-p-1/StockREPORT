@@ -1,0 +1,470 @@
+# -*- coding: utf-8 -*-
+"""
+财报分析平台 (Streamlit)
+========================
+搜索一只 A 股 → 总览 / 三张报表 / 券商研报 交互查看。
+
+运行:
+    streamlit run report_platform.py
+
+数据层复用同目录 quick_report.py（取数逻辑一致，API Key 配置也复用 hithink_config.json）。
+Streamlit 对取数做了缓存（避开同花顺调用配额）。
+
+对比口径（重要）:
+  - 利润表 / 现金流量表是【累计口径】: 一季=3个月、中报=半年、三季=9个月、年报=1年，
+    长度不同直接并列会失真 → 平台默认用「单季」(每列都是3个月，可比)，
+    也可切「中报 H1」/「年报 FY」看同口径同比。
+  - 资产负债表是【时点快照】(期末余额)，不同报告期可直接并列，默认「全部期末」。
+  - 比率类指标(毛利率/净利率/费用率)是百分比，跨尺度可比，趋势图不受影响。
+"""
+
+import re
+import sys
+from pathlib import Path
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+# 复用 quick_report 数据层
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import quick_report as qr  # noqa: E402
+
+st.set_page_config(page_title='财报分析平台', page_icon='📊', layout='wide')
+
+APP_TITLE = '📊 财报分析平台'
+APP_HINT = '搜索股票 → 总览 / 三表 / 研报。数据：同花顺(财报) + 东财(研报)，仅供参考，非投资建议。'
+
+# ========== 中英双语辅助 ==========
+_CN2EN = {cn: en for cn, en in qr.INDICATOR_LABELS.values()}
+
+
+def bi(cn, en):
+    """科目中文 + 英文"""
+    return f'{cn} {en}' if en else cn
+
+
+def _qlabel(y, fp):
+    """单季列标签: 2026Q2 / 2026Q1 ..."""
+    return f'{y}Q{qr.FP_ORDER.get(fp, "?")}'
+
+
+# ========== 缓存取数（TTL 内不重复调接口） ==========
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_resolve(q):
+    return qr.resolve_stock(q)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_snapshot(ths):
+    return qr.get_snapshot(ths)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_valuations(ths):
+    return qr.get_valuations(ths)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_statement(ths, st_key, limit):
+    meta = qr.STATEMENTS[st_key]
+    return qr.ths_get(meta['path'], {'thscode': ths, 'period': 'quarterly', 'limit': limit})
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_indicators(ths):
+    return qr.get_indicators_latest(ths)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_reports(ticker):
+    return qr.get_reports_eastmoney(ticker)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_report_detail(info_code):
+    return qr.get_report_detail(info_code)
+
+
+REPORTS_DIR = Path(__file__).resolve().parent / 'reports' / '研报'
+
+
+def _report_pdf_path(title):
+    safe = re.sub(r'[\\/:*?"<>|]', '', title or '')[:80] or 'report'
+    return REPORTS_DIR / f'{safe}.pdf'
+
+
+# ========== 数据组装（同口径） ==========
+SCOPE_NAMES = {'single': '单季 QoQ (3个月)', 'h1': '中报 H1 同口径',
+               'fy': '年报 FY 同口径', 'all': '期末快照 All (时点)'}
+
+
+def statement_df(ths, st_key, limit, scope='single'):
+    """三表明细 → (DataFrame, series, err)
+
+    scope: single(单季, 每列3个月) / h1(仅中报) / fy(仅年报) / all(期末快照)
+    series: {科目label: {'kind', 'periods', 'values'}} 供点击科目画折线图
+    """
+    meta = qr.STATEMENTS[st_key]
+    j = cached_statement(ths, st_key, limit)
+    if not j or j.get('code') != 0:
+        return pd.DataFrame(), {}, (j or {}).get('message') or '请求失败'
+    items = (j.get('data') or {}).get('item', [])
+    if not items:
+        return pd.DataFrame(), {}, '无数据'
+    is_flow = meta['kind'] == 'flow'
+    cmap = {(it.get('fiscal_year'), it.get('fiscal_period')): it for it in items
+            if it.get('fiscal_year') is not None and it.get('fiscal_period')}
+    single = qr.build_single_quarter(items) if is_flow else {}
+
+    # --- 选列：同口径，时间轴统一 旧→新 (左→右) ---
+    if is_flow and scope == 'single':
+        keys, col_items, col_labels = qr.single_quarter_series(items)
+    else:
+        target = {'h1': 2, 'fy': 4}.get(scope) if scope in ('h1', 'fy') else None
+        keys = sorted((k for k in cmap if target is None or qr.FP_ORDER.get(k[1]) == target),
+                      reverse=True)
+        col_items = [cmap[k] for k in keys]
+        col_labels = [qr._period_label(y, fp) for (y, fp) in keys]
+    keys = keys[::-1]
+    col_items = col_items[::-1]
+    col_labels = col_labels[::-1]
+    if not col_items:
+        return pd.DataFrame(), {}, '该口径暂无数据'
+    cur_key = keys[-1]          # 最新在最右
+    cur = col_items[-1]
+
+    def _yoy_item():
+        if is_flow and scope == 'single':
+            return single.get((cur_key[0] - 1, cur_key[1]))
+        return cmap.get((cur_key[0] - 1, cur_key[1]))
+
+    def _prev_item():
+        # 环比: 单季看前一单季(最新左边一列); 期末快照看上一期末; 同口径(h1/fy)无环比
+        if (is_flow and scope == 'single') or ((not is_flow) and scope == 'all'):
+            return col_items[-2] if len(col_items) > 1 else None
+        return None
+
+    def _disp(v, kind):
+        if v is None:
+            return '-'
+        return qr.fmt_yi(v) if kind == 'amount' else f'{v:.2f}'
+
+    rows, series = [], {}
+    for fname, label, en, kind in meta['fields']:
+        key = bi(label, en)
+        row, vals = {'科目': key}, []
+        for lbl, it in zip(col_labels, col_items):
+            v = qr._field_value(fname, it)
+            row[lbl] = _disp(v, kind)
+            vals.append(v)
+        row['同比'] = qr._fmt_cmp(qr._field_value(fname, cur),
+                                  qr._field_value(fname, _yoy_item()), kind)
+        pv = _prev_item()
+        row['环比'] = (qr._fmt_cmp(qr._field_value(fname, cur),
+                                   qr._field_value(fname, pv), kind) if pv else '-')
+        rows.append(row)
+        series[key] = {'kind': kind, 'periods': list(col_labels), 'values': vals}
+    return pd.DataFrame(rows), series, None
+
+
+def statement_chart(ths, st_key, limit, cols, scope='single'):
+    """三表关键科目 同口径柱状图（金额已转亿）"""
+    meta = qr.STATEMENTS[st_key]
+    j = cached_statement(ths, st_key, limit)
+    items = ((j or {}).get('data') or {}).get('item', []) if j and j.get('code') == 0 else []
+    if not items:
+        return None
+    is_flow = meta['kind'] == 'flow'
+    if is_flow and scope == 'single':
+        _k, seq, labels = qr.single_quarter_series(items)
+    else:
+        target = {'h1': 2, 'fy': 4}.get(scope) if scope in ('h1', 'fy') else None
+        seq = [it for it in items if target is None or qr.FP_ORDER.get(it.get('fiscal_period')) == target]
+        seq = seq[:limit]
+        labels = [qr._period_label(it.get('fiscal_year'), it.get('fiscal_period')) for it in seq]
+    seq = seq[::-1]       # 时间轴: 旧→新 (左→右)
+    labels = labels[::-1]
+    data = []
+    for it, lbl in zip(seq, labels):
+        pt = {'报告期': lbl}
+        for key, name in cols:
+            v = it.get(key)
+            pt[name] = round(v / 1e8, 1) if isinstance(v, (int, float)) else 0.0
+        data.append(pt)
+    return pd.DataFrame(data)
+
+
+def income_ratio_df(ths, limit):
+    """利润表比率趋势: 毛利率/净利率/费用率(%)（比率跨尺度可比）"""
+    j = cached_statement(ths, 'income', limit)
+    items = ((j or {}).get('data') or {}).get('item', []) if j and j.get('code') == 0 else []
+    rows = []
+    for it in items[:limit]:
+        op = it.get('operating_income')
+        if not op:
+            continue
+        lbl = qr._period_label(it.get('fiscal_year'), it.get('fiscal_period'))
+        row = {'报告期': lbl,
+               '毛利率': round(qr._div_pct(qr._sub(op, it.get('operating_costs')), op), 2),
+               '净利率': round(qr._div_pct(it.get('net_profit'), op), 2)}
+        for key, name in [('sales_fee', '销售费用率'), ('manage_fee', '管理费用率'),
+                          ('research_and_development_expenses', '研发费用率')]:
+            row[name] = round(qr._div_pct(it.get(key), op), 2)
+        rows.append(row)
+    return pd.DataFrame(rows[::-1]) if rows else None
+
+
+def single_quarter_df(ths, limit):
+    """单季营收/归母净利（由累计期推导，看环比动能）"""
+    j = cached_statement(ths, 'income', limit)
+    items = ((j or {}).get('data') or {}).get('item', []) if j and j.get('code') == 0 else []
+    if not items:
+        return None
+    _keys, col_items, col_labels = qr.single_quarter_series(items)
+    rows = []
+    for k, s, lbl in zip(reversed(_keys), reversed(col_items), reversed(col_labels)):
+        rows.append({'报告期': lbl,
+                     '单季营收': round((s.get('operating_income') or 0) / 1e8, 1),
+                     '单季归母净利': round((s.get('parent_holder_net_profit') or 0) / 1e8, 1)})
+    return pd.DataFrame(rows)
+
+
+def h1_income_df(ths, limit):
+    """中报同口径: 仅历年 H1（营收/归母净利，升序）"""
+    j = cached_statement(ths, 'income', limit)
+    items = ((j or {}).get('data') or {}).get('item', []) if j and j.get('code') == 0 else []
+    rows = []
+    for it in items:
+        if qr.FP_ORDER.get(it.get('fiscal_period')) == 2:  # 中报
+            rows.append({'报告期': qr._period_label(it.get('fiscal_year'), it.get('fiscal_period')),
+                         '营业收入': round((it.get('operating_income') or 0) / 1e8, 1),
+                         '归母净利润': round((it.get('parent_holder_net_profit') or 0) / 1e8, 1)})
+    return pd.DataFrame(rows[::-1]) if rows else None
+
+
+# ========== 图表渲染 ==========
+def render_bar_chart(df, ycols, title, unit='亿元'):
+    fig = go.Figure()
+    for c in ycols:
+        fig.add_bar(x=df['报告期'], y=df[c], name=c)
+    fig.update_layout(title=title, barmode='group',
+                      xaxis_title='', yaxis_title=unit, height=340,
+                      margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+
+def render_line_chart(df, ycols, title, unit='%'):
+    fig = go.Figure()
+    for c in ycols:
+        fig.add_scatter(x=df['报告期'], y=df[c], mode='lines+markers', name=c,
+                        connectgaps=True)
+    fig.update_layout(title=title, xaxis_title='', yaxis_title=unit, height=320,
+                      margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+
+# ========== 侧边栏 ==========
+with st.sidebar:
+    st.title(APP_TITLE)
+    st.caption(APP_HINT)
+    q = st.text_input('🔍 股票代码或名称', value='中国移动')
+    limit = st.slider('历史期数', min_value=2, max_value=20, value=8, step=1)
+    go_btn = st.button('查询', type='primary', use_container_width=True)
+    st.divider()
+    st.caption('口径说明：利润/现金流默认单季(3个月可比)')
+    st.caption('中报/年报同口径看同比，不混尺度')
+    st.caption('数据仅供研究参考，非投资建议')
+
+with st.spinner('正在拉取数据...'):
+    ticker, ths, name, err = cached_resolve(q.strip())
+
+if err or not ths:
+    st.error(f'未找到标的：{q}')
+    st.stop()
+
+# ========== 主体：Tab 布局 ==========
+st.title(f'{name}  ({ths})')
+st.caption(f'更新于 {qr.datetime.now():%Y-%m-%d %H:%M}')
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    '📋 总览 Overview', '📈 利润表 Income Statement',
+    '📊 资产负债表 Balance Sheet', '💵 现金流量表 Cash Flow',
+    '📰 券商研报 Research',
+])
+
+# ---------- Tab1 总览 Overview ----------
+with tab1:
+    snap = cached_snapshot(ths)
+    if snap:
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric('最新价 Last', qr.fmt_num(snap.get('last_price')),
+                  f"{qr.fmt_num(snap.get('price_change'), 2)} ({qr.fmt_pct(snap.get('price_change_ratio_pct'))})")
+        c2.metric('今开 Open', qr.fmt_num(snap.get('open_price')))
+        c3.metric('最高/最低 H/L', f"{qr.fmt_num(snap.get('high_price'))} / {qr.fmt_num(snap.get('low_price'))}")
+        c4.metric('前收 Prev Close', qr.fmt_num(snap.get('prev_price')))
+        c5.metric('成交额 Turnover', qr.fmt_yi(snap.get('turnover')))
+        c6.metric('数据时间 Time', qr.datetime.now().strftime('%H:%M'))
+
+    val = cached_valuations(ths)
+    if val:
+        st.subheader('估值 Valuation')
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric('PE (TTM)', qr.fmt_num(val.get('pe_ttm')))
+        c2.metric('PE (MRQ)', qr.fmt_num(val.get('pe_mrq')))
+        c3.metric('PB (MRQ)', qr.fmt_num(val.get('pb_mrq')))
+        c4.metric('PS (TTM)', qr.fmt_num(val.get('ps_ttm')))
+        c5.metric('PCF (TTM)', qr.fmt_num(val.get('pcf_ttm')))
+
+    st.subheader('收入与利润 Revenue & Profit（同口径）')
+    r1, r2 = st.columns(2)
+    with r1:
+        sdf = single_quarter_df(ths, limit)
+        if sdf is not None and not sdf.empty:
+            render_bar_chart(sdf, ['单季营收', '单季归母净利'],
+                             '单季营收 / 归母净利 Single Quarter（每格3个月）')
+    with r2:
+        hdf = h1_income_df(ths, limit)
+        if hdf is not None and not hdf.empty:
+            render_bar_chart(hdf, ['营业收入', '归母净利润'],
+                             '中报 H1 历年同口径（营收/归母净利 YoY 直接可比）')
+
+    rdf = income_ratio_df(ths, limit)
+    if rdf is not None and not rdf.empty:
+        render_line_chart(rdf, ['毛利率', '净利率'], '毛利率 / 净利率趋势 Margin Trend')
+        render_line_chart(rdf, ['销售费用率', '管理费用率', '研发费用率'],
+                          '费用率趋势 Expense Ratios')
+
+    rows, cur_key, prev_key, ierr = qr.get_income_analysis(ths)
+    if not ierr and cur_key and prev_key:
+        allitems = ((cached_statement(ths, 'income', 10).get('data') or {}).get('item', []))
+        tmap = {(it.get('fiscal_year'), it.get('fiscal_period')): it for it in allitems}
+        ci, pi = tmap.get(cur_key), tmap.get(prev_key)
+        if ci and pi:
+            lbl = qr._period_label(*cur_key)
+            st.info(f'**{lbl} 同比 YoY（同口径）** · 营收 Revenue '
+                    f'{qr.fmt_pct(qr._pct(ci.get("operating_income"), pi.get("operating_income")))}, '
+                    f'归母净利 Net Profit '
+                    f'{qr.fmt_pct(qr._pct(ci.get("parent_holder_net_profit"), pi.get("parent_holder_net_profit")))}')
+
+    st.subheader('财务指标 Financial Indicators')
+    report, abilities, aerr = cached_indicators(ths)
+    if abilities:
+        st.caption(f'报告期 Report {report}')
+        for cat, inds in abilities.items():
+            with st.expander(cat, expanded=(cat == '盈利能力')):
+                for k, v in inds.items():
+                    en = _CN2EN.get(k, '')
+                    st.markdown(f'**{k}** {en}  →  {qr.fmt_num(v, 2)}')
+    else:
+        st.warning(aerr)
+
+# ---------- Tab2-4 三表明细（同口径） ----------
+STATEMENT_TAB = {'income': (tab2, '📈 利润表 Income Statement'),
+                 'balance': (tab3, '📊 资产负债表 Balance Sheet'),
+                 'cashflow': (tab4, '💵 现金流量表 Cash Flow')}
+CHART_COLS = {
+    'income': [('operating_income', '营业收入 Revenue'), ('parent_holder_net_profit', '归母净利润 Net Profit')],
+    'balance': [('assets_total', '资产 Total Assets'), ('total_debt', '负债 Total Liabilities'),
+                ('holder_equity_total', '权益 Total Equity')],
+    'cashflow': [('act_cash_flow_net', '经营 Operating'), ('invest_cash_flow_net', '投资 Investing'),
+                 ('financing_cash_flow_net', '筹资 Financing')],
+}
+
+for st_key, (tab, title) in STATEMENT_TAB.items():
+    with tab:
+        is_flow = qr.STATEMENTS[st_key]['kind'] == 'flow'
+        opts = ['single', 'h1', 'fy'] if is_flow else ['all', 'h1', 'fy']
+        scope = st.radio('报告口径 Scale（只显示同尺度数据）', opts, index=0, horizontal=True,
+                         format_func=lambda s: SCOPE_NAMES[s], key=f'scope_{st_key}')
+        hint = ('每列都是3个月单季，环比=前一单季' if (is_flow and scope == 'single')
+                else ('仅历年' + ('中报' if scope == 'h1' else '年报') + '，同比=去年同期'
+                      if scope in ('h1', 'fy')
+                      else '期末时点快照，可直接并列'))
+        st.caption(f'**{title}** · {hint} · 同比 YoY 列已同口径')
+
+        cdf = statement_chart(ths, st_key, limit, CHART_COLS[st_key], scope)
+        if cdf is not None and not cdf.empty:
+            render_bar_chart(cdf, [c[1] for c in CHART_COLS[st_key]], f'{title} 关键科目 Key Items')
+
+        if st_key == 'balance' and scope != 'all':
+            field, rlabel = 'debt_ratio', '资产负债率 Debt-to-Asset Ratio'
+            j = cached_statement(ths, st_key, limit)
+            items = ((j or {}).get('data') or {}).get('item', []) if j and j.get('code') == 0 else []
+            rr = []
+            for it in items[:limit]:
+                if qr.FP_ORDER.get(it.get('fiscal_period')) in ({'h1': 2, 'fy': 4}[scope],):
+                    v = qr._field_value(field, it)
+                    rr.append({'报告期': qr._period_label(it.get('fiscal_year'), it.get('fiscal_period')),
+                               rlabel: round(v, 2) if v is not None else None})
+            if rr:
+                render_line_chart(pd.DataFrame(rr[::-1]), [rlabel], f'{rlabel} 趋势')
+
+        with st.expander('📄 明细表 Detail'):
+            df, series, serr = statement_df(ths, st_key, limit, scope)
+            if serr:
+                st.warning(serr)
+            else:
+                st.dataframe(df, width='stretch', hide_index=True)
+                label = st.selectbox('📈 选择「科目」Line Item（自动出折线图）',
+                                     list(series.keys()), index=0,
+                                     key=f'item_{st_key}_{scope}')
+                s = series.get(label)
+                if s:
+                    cdf2 = pd.DataFrame({'报告期': s['periods'],
+                                         '值': pd.to_numeric(s['values'], errors='coerce')})
+                    if s['kind'] == 'amount':
+                        cdf2['值'] = cdf2['值'] / 1e8
+                        unit = '亿元'
+                    elif s['kind'] == 'ratio':
+                        unit = '%'
+                    else:
+                        unit = ''
+                    render_line_chart(cdf2, ['值'], f'{label} 趋势 Line Trend', unit)
+
+# ---------- Tab5 研报 ----------
+with tab5:
+    st.subheader('最近券商研报 Research Reports（东财）')
+    reports = cached_reports(ticker)
+    if not reports:
+        st.info('未获取到研报')
+    else:
+        rr = []
+        for it in reports:
+            rr.append({
+                '标题 Title': it.get('title', ''),
+                '机构 Org': it.get('orgSName', ''),
+                '日期 Date': str(it.get('publishDate', ''))[:10],
+                '评级 Rating': it.get('emRatingName', '') or '-',
+            })
+        st.dataframe(pd.DataFrame(rr), width='stretch', hide_index=True)
+        # 下拉选择研报 → 摘要 + 去重下载（可靠切换）
+        options = [f"{i + 1}. {r.get('title', '')}｜{r.get('orgSName', '')}｜{str(r.get('publishDate', ''))[:10]}"
+                   for i, r in enumerate(reports)]
+        choice = st.selectbox('📄 选择研报看摘要（可下载 PDF）', options, key='report_choice')
+        idx = options.index(choice)
+        rep = reports[idx]
+        title = rep.get('title', '')
+        st.divider()
+        st.markdown(f'**{title}**  ·  {rep.get("orgSName", "")}  ·  '
+                    f'{str(rep.get("publishDate", ""))[:10]}  ·  {rep.get("emRatingName", "") or ""}')
+        abstract, pdf = cached_report_detail(rep.get('infoCode', ''))
+        if abstract:
+            st.markdown(abstract[:600])
+        else:
+            st.caption('（未抓到摘要）')
+        if pdf:
+            path = _report_pdf_path(title)
+            if path.exists():
+                st.success(f'✅ 该篇已下载过：`{path.name}`（不再重复下载）')
+            elif st.button('⬇️ 下载这篇 PDF', type='primary'):
+                if qr.download_report_pdf(pdf, path):
+                    st.success(f'已保存：`{path}`')
+                    st.rerun()
+                else:
+                    st.error('下载失败')
+        else:
+            st.caption('（无 PDF 链接）')

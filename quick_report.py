@@ -1,0 +1,730 @@
+# -*- coding: utf-8 -*-
+"""
+快速看财报 - quick_report.py
+============================
+输入股票代码或名称, 输出一份「财报速览」:
+  1. 基本资料 + 最新行情快照                    (同花顺 hithink-finance)
+  2. 利润表速览: 最近期 + 去年同期, 自动算同比   (同花顺 hithink-finance)
+  3. 财务指标: 成长/盈利/偿债/营运/现金流五类    (同花顺 hithink-finance)
+  4. 估值快照: PE/PB/PS/PCF                     (同花顺 hithink-finance)
+  5. 券商研报最近若干条(标题/机构/日期/评级)     (东财 reportapi, 免key)
+
+用法:
+  python quick_report.py 600941              总览(行情/估值/利润表速览/指标/研报)
+  python quick_report.py 中国移动            支持按名称
+  python quick_report.py 600941 -t income    利润表明细(历史多期+同比+环比)
+  python quick_report.py 600941 -t balance   资产负债表明细
+  python quick_report.py 600941 -t cashflow  现金流量表明细
+  python quick_report.py 600941 -t all       总览 + 三表明细
+  python quick_report.py 600941 -n 8         明细历史期数(默认6)
+
+对比维度:
+  - 同比: 最新累计期 vs 去年同期累计
+  - 环比: 利润表/现金流 = 最新单季 vs 上一单季(由累计期推导);
+          资产负债表 = 本期期末 vs 上期期末
+
+API Key 配置(优先级从高到低):
+  1. 环境变量 HITHINK_FINANCE_API_KEY
+  2. 本文件同目录 hithink_config.json 里的 "api_key" 字段
+  3. 运行时提示输入(getpass)
+
+注意:
+  - 同花顺接口有请求配额, 脚本内置 0.6s 节流 + 429 指数退避重试
+  - 财务指标可能滞后于最新财报, 会自动回退到最近可用报告期
+  - 研报来自东财 reportapi, 无 key, 仅供学习研究
+"""
+
+import sys
+import os
+import json
+import re
+import time
+import getpass
+import argparse
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import requests
+
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+# ========== 配置 ==========
+BASE = 'https://fuyao.aicubes.cn'
+CONFIG_PATH = Path(__file__).resolve().parent / 'hithink_config.json'
+THS_THROTTLE = 0.6      # 同花顺请求间隔(秒)
+EM_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+         '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+# ========== API Key 解析 ==========
+API_KEY = os.environ.get('HITHINK_FINANCE_API_KEY')
+if not API_KEY and CONFIG_PATH.exists():
+    try:
+        API_KEY = json.loads(CONFIG_PATH.read_text(encoding='utf-8')).get('api_key')
+    except Exception:
+        pass
+if not API_KEY:
+    API_KEY = getpass.getpass('请输入同花顺 API Key: ')
+
+# ========== 工具函数 ==========
+def ths_get(path, params, retries=4):
+    """同花顺 GET, 带节流 + 429 退避重试"""
+    time.sleep(THS_THROTTLE)
+    url = BASE + path
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params,
+                             headers={'X-api-key': API_KEY},
+                             timeout=20)
+            j = r.json()
+            code = j.get('code')
+            if code == 429:                      # 限流
+                wait = 2 ** attempt
+                print(f'  [同花顺限流429] {wait}s 后重试...')
+                time.sleep(wait)
+                continue
+            return j
+        except requests.RequestException as e:
+            wait = 2 ** attempt
+            print(f'  [同花顺请求失败] {e} {wait}s 后重试...')
+            time.sleep(wait)
+    return {'code': -1, 'message': '请求多次失败', 'data': None}
+
+
+def fmt_yi(v, nd=2):
+    """数值(元) → 亿字符串"""
+    if v is None:
+        return '-'
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return '-'
+    if abs(v) >= 1e12:
+        return f'{v/1e12:.{nd}f}万亿'
+    if abs(v) >= 1e8:
+        return f'{v/1e8:.{nd}f}亿'
+    if abs(v) >= 1e4:
+        return f'{v/1e4:.{nd}f}万'
+    return f'{v:.{nd}f}'
+
+
+def fmt_pct(v):
+    """百分比数值 → 'xx.x%'"""
+    if v is None:
+        return '-'
+    try:
+        return f'{float(v):+.2f}%' if abs(float(v)) < 10000 else f'{float(v):+.1f}%'
+    except (TypeError, ValueError):
+        return '-'
+
+
+def fmt_num(v, nd=2):
+    if v is None:
+        return '-'
+    try:
+        return f'{float(v):.{nd}f}'
+    except (TypeError, ValueError):
+        return '-'
+
+
+def now_ms():
+    return int(datetime.now().timestamp() * 1000)
+
+
+def _guess_thscode(ticker):
+    if ticker.startswith(('6', '9')):
+        return ticker + '.SH'
+    if ticker.startswith(('0', '3')):
+        return ticker + '.SZ'
+    if ticker.startswith(('4', '8')):
+        return ticker + '.BJ'
+    return None
+
+
+def _period_label(fy, fp):
+    q = FP_ORDER.get(fp)
+    return f'{fy}{FP_NAME.get(q, fp)}' if q else f'{fy}{fp}'
+
+
+def _tbl(headers, rows):
+    """用 tabulate 输出表格(已安装), 失败则退化到简单打印"""
+    try:
+        from tabulate import tabulate
+        return tabulate(rows, headers=headers, tablefmt='simple', stralign='left',
+                        numalign='right')
+    except Exception:
+        w = [max(len(str(h)), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
+        lines = ['  '.join(h.ljust(w[i]) for i, h in enumerate(headers)),
+                 '  '.join('-' * w[i] for i in range(len(headers)))]
+        for r in rows:
+            lines.append('  '.join(str(c).ljust(w[i]) for i, c in enumerate(r)))
+        return '\n'.join(lines)
+
+
+# ========== 1. 标的解析 ==========
+def resolve_stock(q):
+    """输入 代码/名称 → (ticker, thscode, name, err)"""
+    q = q.strip()
+    m = re.fullmatch(r'(\d{6})(?:\.(SH|SZ|BJ))?', q, re.I)
+    if m:
+        ticker = m.group(1)
+        ex = (m.group(2) or '').upper()
+        ths = f'{ticker}.{ex}' if ex else _guess_thscode(ticker)
+        if not ths:
+            return None, None, None, f'无法推断 {ticker} 的交易所'
+        name = ''
+        j = ths_get('/api/meta/tickers/search', {'q': ticker, 'limit': 5})
+        for it in (j.get('data') or {}).get('item', []):
+            if it.get('thscode') == ths:
+                name = it.get('name', '')
+                break
+        return ticker, ths, name or q, None
+    # 名称检索
+    j = ths_get('/api/meta/tickers/search', {'q': q, 'limit': 8})
+    for it in (j.get('data') or {}).get('item', []):
+        if it.get('asset_type') == 'a-share':
+            return it.get('ticker'), it.get('thscode'), it.get('name') or q, None
+    return None, None, None, f'未找到标的: {q}'
+
+
+# ========== 2. 行情 + 估值 ==========
+def get_snapshot(thscode):
+    j = ths_get('/api/a-share/prices/snapshot', {'thscodes': thscode})
+    if not j or j.get('code') != 0:
+        return None
+    items = (j.get('data') or {}).get('item', [])
+    return items[0] if items else None
+
+
+def get_valuations(thscode):
+    j = ths_get('/api/a-share/valuations/snapshot', {'thscodes': thscode})
+    if not j or j.get('code') != 0:
+        return None
+    items = (j.get('data') or {}).get('item', [])
+    return items[0] if items else None
+
+
+# ========== 3. 利润表分析(自动同比) ==========
+def get_income_analysis(thscode, limit=10):
+    """返回 (rows, cur_key, prev_key, err)
+    rows: [(fiscal_year, fiscal_period, 营收, 归母净利, EPS, 报告期), ...]
+    """
+    j = ths_get('/api/a-share/financials/income-statements',
+                {'thscode': thscode, 'period': 'quarterly', 'limit': limit})
+    if not j:
+        return [], None, None, '请求失败'
+    if j.get('code') != 0:
+        return [], None, None, f"同花顺错误: {j.get('message')}"
+    items = (j.get('data') or {}).get('item', [])
+    if not items:
+        return [], None, None, '无利润表数据'
+    table = {}
+    rows = []
+    for it in items:
+        key = (it.get('fiscal_year'), it.get('fiscal_period'))
+        table[key] = it
+        rows.append((it.get('fiscal_year'), it.get('fiscal_period'),
+                     it.get('operating_income'), it.get('parent_holder_net_profit'),
+                     it.get('basic_eps')))
+    cur = items[0]                     # 最新(降序第一)
+    cur_key = (cur.get('fiscal_year'), cur.get('fiscal_period'))
+    prev_key = (cur_key[0] - 1, cur_key[1]) if cur_key[1] else None
+    return rows, cur_key, prev_key, None
+
+
+def _pct(new, old):
+    if new is None or old in (None, 0):
+        return None
+    try:
+        return (float(new) - float(old)) / abs(float(old)) * 100
+    except (TypeError, ValueError):
+        return None
+
+
+# ========== 4. 财务指标(自动回退报告期) ==========
+ABILITY_NAMES = {
+    'growth': '成长能力', 'profitability': '盈利能力',
+    'solvency': '偿债能力', 'operation': '营运能力', 'cash-flow': '现金流',
+}
+INDICATOR_LABELS = {
+    'calculate_operating_income_yoy_growth_ratio': ('营收同比', 'Revenue YoY'),
+    'calculate_operating_profit_yoy_growth_ratio': ('营业利润同比', 'Operating Profit YoY'),
+    'calculate_parent_holder_net_profit_yoy_growth_ratio': ('归母净利同比', 'Net Profit YoY'),
+    'total_assets_growth_ratio': ('总资产同比', 'Total Assets YoY'),
+    'fixed_asset_invest_expansion_ratio': ('固定资产扩张率', 'Fixed Asset Expansion'),
+    'index_weighted_avg_roe': ('加权ROE', 'Weighted ROE'),
+    'index_deduct_weighted_avg_roe': ('扣非ROE', 'ROE excl. Non-recurring'),
+    'sale_gross_margin': ('销售毛利率', 'Gross Margin'),
+    'sale_net_interest_ratio': ('销售净利率', 'Net Margin'),
+    'total_assets_net_ratio': ('总资产净利率', 'ROA'),
+    'assets_debt_ratio': ('资产负债率', 'Debt-to-Asset Ratio'),
+    'current_ratio': ('流动比率', 'Current Ratio'),
+    'quick_ratio': ('速动比率', 'Quick Ratio'),
+    'cash_ratio': ('现金比率', 'Cash Ratio'),
+    'earned_interest_multiple': ('已获利息倍数', 'Interest Coverage'),
+    'total_assets_turnover_ratio': ('总资产周转率', 'Asset Turnover'),
+    'inventory_turnover_ratio': ('存货周转率', 'Inventory Turnover'),
+    'current_assets_turnover_ratio': ('流动资产周转率', 'Current Asset Turnover'),
+    'receive_account_turnover_ratio': ('应收账款周转率', 'Receivable Turnover'),
+    'long_term_debt_equity_ratio': ('长期债务权益比', 'LT Debt/Equity'),
+    'net_profit_cash_content': ('净利润现金含量', 'Cash Content of Profit'),
+    'cash_operating_index': ('经营现金指数', 'Operating Cash Index'),
+    'operating_cash_flow_net_divide_income': ('经营现金流/净利润', 'OCF/Net Profit'),
+    'cash_meet_invest_ratio': ('现金满足投资比率', 'Cash/Investment'),
+}
+
+
+def _indicator_candidates():
+    """按当前月份生成候选报告期(最近优先)"""
+    y = datetime.now().year
+    m = datetime.now().month
+    if m >= 11:
+        latest = [(y, 4)]
+    elif m >= 9:
+        latest = [(y, 3)]
+    elif m >= 5:
+        latest = [(y, 2)]
+    else:
+        latest = [(y - 1, 4)]
+    cands = latest + [(y - 1, 4), (y, 1), (y - 1, 2), (y - 1, 3)]
+    seen, out = set(), []
+    for yy, qq in cands:
+        c = f'{yy}-{qq}'
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def get_indicators_latest(thscode):
+    """返回 (report, abilities_dict, err) — abilities_dict: {ability: {label: value}}"""
+    for report in _indicator_candidates():
+        j = ths_get('/api/a-share/financials/indicators',
+                    {'thscode': thscode, 'report': report})
+        if not j or j.get('code') != 0:
+            continue                     # 429/5003(空)/其他 → 试下一个
+        abilities = (j.get('data') or {}).get('abilities', [])
+        if not abilities:
+            continue
+        result = {}
+        for ab in abilities:
+            name = ab.get('ability', '')
+            items = ab.get('indicators', [])
+            mapped = {}
+            for it in items:
+                iid = it.get('index_id', '')
+                mapped[INDICATOR_LABELS.get(iid, (iid, iid))[0]] = it.get('value')
+            result[ABILITY_NAMES.get(name, name)] = mapped
+        return report, result, None
+    return None, {}, '财务指标暂不可用(报告期未算好或超配额)'
+
+
+# ========== 5. 东财研报(免key) ==========
+def get_reports_eastmoney(ticker, page_size=8, begin='2025-01-01'):
+    """东财 reportapi 个股研报列表"""
+    end = datetime.now().strftime('%Y-%m-%d')
+    body = {'pageSize': page_size, 'pageNo': 1,
+            'beginTime': begin, 'endTime': end, 'code': ticker}
+    try:
+        r = requests.post('https://reportapi.eastmoney.com/report/list2',
+                          json=body,
+                          headers={'Content-Type': 'application/json',
+                                   'User-Agent': EM_UA},
+                          timeout=20)
+        j = r.json()
+        items = j.get('data') or []
+        return items if isinstance(items, list) else []
+    except Exception as e:
+        print(f'  [研报获取失败] {e}')
+        return []
+
+
+def get_report_detail(info_code):
+    """抓东财研报详情页 → (摘要, pdf_url)"""
+    if not info_code:
+        return '', ''
+    url = 'https://data.eastmoney.com/report/zw_industry.jshtml?infocode=' + info_code
+    try:
+        r = requests.get(url, headers={'User-Agent': EM_UA}, timeout=20)
+        html = r.text
+        ps = re.findall(r'<p[^>]*>(.*?)</p>', html, re.S)
+        txt = ''.join(re.sub(r'<[^>]+>', '', p) for p in ps)
+        txt = re.sub(r'\s+', ' ', txt).strip()
+        m = re.search(r'https://pdf\.dfcfw\.com/pdf/[^\s"\'<>]+?\.pdf', html)
+        pdf = m.group(0) if m else ''
+        return txt, pdf
+    except Exception:
+        return '', ''
+
+
+def download_report_pdf(pdf_url, save_path):
+    """下载研报PDF(带 %PDF 校验), 返回是否成功"""
+    try:
+        r = requests.get(pdf_url, headers={'User-Agent': EM_UA}, timeout=30)
+        if r.status_code == 200 and r.content[:4] == b'%PDF':
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(r.content)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ========== 6. 三表明细(历史多期 + 同比 + 环比) ==========
+FP_ORDER = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'FY': 4, 'Annual': 4, 'Y': 4}
+FP_NAME = {1: '一季', 2: '中报', 3: '三季', 4: '年报'}
+_Q_TO_FP = {1: 'Q1', 2: 'Q2', 3: 'Q3', 4: 'Q4'}
+
+STATEMENTS = {
+    'income': {
+        'path': '/api/a-share/financials/income-statements',
+        'name': '利润表',
+        'kind': 'flow',
+        'fields': [
+            ('operating_income', '营业收入', 'Operating Revenue', 'amount'),
+            ('operating_costs', '营业成本', 'Operating Costs', 'amount'),
+            ('gross_profit', '毛利', 'Gross Profit', 'amount'),
+            ('gross_margin', '毛利率', 'Gross Margin', 'ratio'),
+            ('sales_fee', '销售费用', 'Selling Expenses', 'amount'),
+            ('manage_fee', '管理费用', 'G&A Expenses', 'amount'),
+            ('research_and_development_expenses', '研发费用', 'R&D Expenses', 'amount'),
+            ('rd_ratio', '研发费用率', 'R&D Ratio', 'ratio'),
+            ('operating_profit', '营业利润', 'Operating Profit', 'amount'),
+            ('profit_total', '利润总额', 'Total Profit', 'amount'),
+            ('income_tax_expense', '所得税费用', 'Income Tax', 'amount'),
+            ('net_profit', '净利润', 'Net Profit', 'amount'),
+            ('parent_holder_net_profit', '归母净利润', 'Net Profit to Parent', 'amount'),
+            ('basic_eps', '基本EPS', 'Basic EPS', 'num'),
+        ],
+    },
+    'balance': {
+        'path': '/api/a-share/financials/balance-sheets',
+        'name': '资产负债表',
+        'kind': 'point',
+        'fields': [
+            ('cash', '货币资金', 'Cash & Equivalents', 'amount'),
+            ('accounts_receivable', '应收账款', 'Accounts Receivable', 'amount'),
+            ('total_current_assets', '流动资产合计', 'Total Current Assets', 'amount'),
+            ('non_current_nets_total', '非流动资产净值', 'Non-current Assets', 'amount'),
+            ('assets_total', '资产总计', 'Total Assets', 'amount'),
+            ('total_debt', '负债合计', 'Total Liabilities', 'amount'),
+            ('holder_equity_total', '所有者权益合计', 'Total Equity', 'amount'),
+            ('debt_ratio', '资产负债率', 'Debt-to-Asset Ratio', 'ratio'),
+        ],
+    },
+    'cashflow': {
+        'path': '/api/a-share/financials/cash-flow-statements',
+        'name': '现金流量表',
+        'kind': 'flow',
+        'fields': [
+            ('act_cash_flow_net', '经营现金流净额', 'Operating CF', 'amount'),
+            ('invest_cash_flow_net', '投资现金流净额', 'Investing CF', 'amount'),
+            ('financing_cash_flow_net', '筹资现金流净额', 'Financing CF', 'amount'),
+            ('cash_equivalents_net_addition', '现金及等价物净增加', 'Net Cash Addition', 'amount'),
+            ('pay_fixed_assets_etc_cash', '购建固定资产等支出', 'CAPEX', 'amount'),
+            ('pay_dividends_profits_interest_cash', '分配股利/付息支出', 'Dividends & Interest', 'amount'),
+        ],
+    },
+}
+
+
+def _sub(a, b):
+    if a is None or b is None:
+        return None
+    return a - b
+
+
+def _div_pct(a, b):
+    if a is None or b in (None, 0):
+        return None
+    return a / b * 100
+
+
+def _field_value(field, item):
+    """取科目值, 含派生字段(毛利/毛利率/研发费用率/负债率)"""
+    if item is None:
+        return None
+    if field == 'gross_profit':
+        return _sub(item.get('operating_income'), item.get('operating_costs'))
+    if field == 'gross_margin':
+        return _div_pct(_sub(item.get('operating_income'), item.get('operating_costs')),
+                        item.get('operating_income'))
+    if field == 'rd_ratio':
+        return _div_pct(item.get('research_and_development_expenses'),
+                        item.get('operating_income'))
+    if field == 'debt_ratio':
+        return _div_pct(item.get('total_debt'), item.get('assets_total'))
+    return item.get(field)
+
+
+def build_single_quarter(items):
+    """利润表/现金流(累计口径) → 单季值 {(year, fp): {field: v}}"""
+    cmap = {}
+    for it in items:
+        y, fp = it.get('fiscal_year'), it.get('fiscal_period')
+        if y is not None and fp:
+            cmap[(y, fp)] = it
+    out = {}
+    for (y, fp), it in cmap.items():
+        q = FP_ORDER.get(fp)
+        if q and q > 1:
+            prev = cmap.get((y, _Q_TO_FP[q - 1]))
+            if prev is not None:
+                s = {}
+                for k, v in it.items():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        pv = prev.get(k)
+                        s[k] = v - pv if isinstance(pv, (int, float)) else v
+                    else:
+                        s[k] = v
+                out[(y, fp)] = s
+                continue
+        out[(y, fp)] = dict(it)      # Q1 或缺前一期 → 单季=累计
+    return out
+
+
+def single_quarter_series(items):
+    """单季序列(按时间倒序), 自动丢弃缺前一期数据的最早一期(其"单季"实为累计值)
+    返回 (keys, col_items, col_labels), 每列都是3个月可比
+    """
+    single = build_single_quarter(items)
+    cmap = {(it.get('fiscal_year'), it.get('fiscal_period')): it for it in items
+            if it.get('fiscal_year') is not None and it.get('fiscal_period')}
+    keys = sorted(single.keys(), reverse=True)
+    if keys:
+        ly, lfp = keys[-1]
+        lq = FP_ORDER.get(lfp)
+        if lq and lq > 1 and (ly, _Q_TO_FP[lq - 1]) not in cmap:
+            keys = keys[:-1]
+    col_items = [single[k] for k in keys]
+    col_labels = [f'{y}Q{FP_ORDER.get(fp)}' for (y, fp) in keys]
+    return keys, col_items, col_labels
+
+
+def _fmt_val(v, kind):
+    if v is None:
+        return '-'
+    if kind == 'amount':
+        return fmt_yi(v)
+    return f'{v:.2f}'
+
+
+def _fmt_cmp(curv, prevv, kind):
+    """同比/环比格式化: amount → %, ratio → 百分点差, num → %"""
+    if curv is None or prevv is None:
+        return '-'
+    if kind == 'ratio':
+        return f'{curv - prevv:+.2f}'
+    p = _pct(curv, prevv)
+    return f'{p:+.1f}%' if p is not None else '-'
+
+
+def render_statement(ths, st_key, limit=6, scope=None):
+    """渲染单张表明细(同口径). scope: single(默认,flow单季)/h1(中报)/fy(年报)/all(期末快照)"""
+    meta = STATEMENTS[st_key]
+    j = ths_get(meta['path'], {'thscode': ths, 'period': 'quarterly', 'limit': limit})
+    if not j or j.get('code') != 0:
+        print(f'  {meta["name"]}: ' + ((j or {}).get('message') or '请求失败'))
+        return
+    items = (j.get('data') or {}).get('item', [])
+    if not items:
+        print(f'  {meta["name"]}: 无数据')
+        return
+    is_flow = meta['kind'] == 'flow'
+    if scope is None:
+        scope = 'single' if is_flow else 'all'
+    cmap = {(it.get('fiscal_year'), it.get('fiscal_period')): it for it in items
+            if it.get('fiscal_year') is not None and it.get('fiscal_period')}
+    single = build_single_quarter(items) if is_flow else {}
+
+    # --- 选列: 同口径 ---
+    if is_flow and scope == 'single':
+        keys, col_items, col_labels = single_quarter_series(items)
+    else:
+        target = {'h1': 2, 'fy': 4}.get(scope) if scope in ('h1', 'fy') else None
+        keys = sorted((k for k in cmap if target is None or FP_ORDER.get(k[1]) == target),
+                      reverse=True)
+        col_items = [cmap[k] for k in keys]
+        col_labels = [_period_label(y, fp) for (y, fp) in keys]
+    if not col_items:
+        print(f'  {meta["name"]}: 该口径暂无数据')
+        return
+    cur_key, cur = keys[0], col_items[0]
+
+    def _yoy_item():
+        if is_flow and scope == 'single':
+            return single.get((cur_key[0] - 1, cur_key[1]))
+        return cmap.get((cur_key[0] - 1, cur_key[1]))
+
+    def _prev_item():
+        # 环比: 单季看前一单季; 期末快照看上一期末; 同口径(h1/fy)无环比
+        if (is_flow and scope == 'single') or ((not is_flow) and scope == 'all'):
+            return col_items[1] if len(col_items) > 1 else None
+        return None
+
+    header = ['科目'] + col_labels + ['同比', '环比']
+    rows = []
+    for fname, label, _en, kind in meta['fields']:
+        row = [label]
+        for it in col_items:
+            row.append(_fmt_val(_field_value(fname, it), kind))
+        row.append(_fmt_cmp(_field_value(fname, cur), _field_value(fname, _yoy_item()), kind))
+        pv = _prev_item()
+        row.append(_fmt_cmp(_field_value(fname, cur), _field_value(fname, pv), kind) if pv else '-')
+        rows.append(row)
+    note = ('金额=亿元; 每列=单季(3个月), 环比=前一单季' if (is_flow and scope == 'single')
+            else ('仅历年' + ('中报' if scope == 'h1' else '年报') + ', 同比=去年同期'
+                  if scope in ('h1', 'fy') else '期末时点快照, 环比=上期期末'))
+    print(f'\n[{st_key}] {meta["name"]}明细 ({note})')
+    print(_tbl(header, rows))
+
+
+# ========== 主流程 ==========
+def show_overview(ths, ticker, name):
+    """总览: 行情/估值/利润表速览/财务指标/研报"""
+    print(f'\n{"=" * 70}')
+    print(f'  {name} ({ths})  财报速览  {datetime.now():%Y-%m-%d %H:%M}')
+    print(f'{"=" * 70}')
+
+    # --- 行情快照 ---
+    snap = get_snapshot(ths)
+    if snap:
+        rows = [
+            ['最新价', fmt_num(snap.get('last_price')),
+             '涨跌', f"{fmt_num(snap.get('price_change'), 2)} ({fmt_pct(snap.get('price_change_ratio_pct'))})"],
+            ['今开', fmt_num(snap.get('open_price')),
+             '最高/最低', f"{fmt_num(snap.get('high_price'))} / {fmt_num(snap.get('low_price'))}"],
+            ['前收', fmt_num(snap.get('prev_price')),
+             '成交额', fmt_yi(snap.get('turnover'))],
+        ]
+        print('\n[1] 行情快照')
+        print(_tbl(['指标', '值', '指标', '值'], rows))
+
+    # --- 估值 ---
+    val = get_valuations(ths)
+    if val:
+        rows = [
+            ['PE(TTM)', fmt_num(val.get('pe_ttm')), 'PE(MRQ)', fmt_num(val.get('pe_mrq'))],
+            ['PB(MRQ)', fmt_num(val.get('pb_mrq')), 'PS(TTM)', fmt_num(val.get('ps_ttm'))],
+            ['PCF(TTM)', fmt_num(val.get('pcf_ttm')), '', ''],
+        ]
+        print('\n[2] 估值')
+        print(_tbl(['指标', '值', '指标', '值'], rows))
+
+    # --- 利润表 ---
+    rows, cur_key, prev_key, err = get_income_analysis(ths)
+    if err:
+        print(f'\n[3] 利润表速览: {err}')
+    else:
+        print('\n[3] 利润表速览(最近期及同比)')
+        j = ths_get('/api/a-share/financials/income-statements',
+                    {'thscode': ths, 'period': 'quarterly', 'limit': 4})
+        raw = (j.get('data') or {}).get('item', []) if j and j.get('code') == 0 else []
+        tbl_rows = []
+        for it in raw:
+            lbl = _period_label(it.get('fiscal_year'), it.get('fiscal_period'))
+            tbl_rows.append([lbl,
+                             fmt_yi(it.get('operating_income')),
+                             fmt_yi(it.get('parent_holder_net_profit')),
+                             fmt_num(it.get('basic_eps'))])
+        print(_tbl(['报告期', '营业收入', '归母净利润', '基本EPS'], tbl_rows))
+        if cur_key and prev_key:
+            # 重取以拿 cur/prev 原始值
+            jj = ths_get('/api/a-share/financials/income-statements',
+                         {'thscode': ths, 'period': 'quarterly', 'limit': 10})
+            allitems = (jj.get('data') or {}).get('item', []) if jj and jj.get('code') == 0 else []
+            tmap = {(it.get('fiscal_year'), it.get('fiscal_period')): it for it in allitems}
+            cur_it = tmap.get(cur_key)
+            prev_it = tmap.get(prev_key)
+            if cur_it and prev_it:
+                rev_yoy = _pct(cur_it.get('operating_income'),
+                               prev_it.get('operating_income'))
+                np_yoy = _pct(cur_it.get('parent_holder_net_profit'),
+                              prev_it.get('parent_holder_net_profit'))
+                lbl = _period_label(cur_key[0], cur_key[1])
+                print(f'  {lbl} 同比: 营收 {fmt_pct(rev_yoy)}, '
+                      f'归母净利 {fmt_pct(np_yoy)}')
+
+    # --- 财务指标 ---
+    report, abilities, ierr = get_indicators_latest(ths)
+    if abilities:
+        print(f'\n[4] 财务指标(报告期 {report})')
+        for cat, inds in abilities.items():
+            line = '  '.join(f'{k} {fmt_num(v, 2)}' for k, v in inds.items())
+            print(f'  {cat}: {line}')
+    else:
+        print(f'\n[4] 财务指标: {ierr}')
+
+    # --- 研报 ---
+    print('\n[5] 券商研报(东财, 最近8条)')
+    reports = get_reports_eastmoney(ticker)
+    if not reports:
+        print('  (未获取到研报)')
+    else:
+        rrows = []
+        for it in reports:
+            title = it.get('title', '')
+            title = title[:38] + '..' if len(title) > 40 else title
+            rrows.append([title[:20] + ('..' if len(title) > 20 else ''),
+                          it.get('orgSName', ''),
+                          str(it.get('publishDate', ''))[:10],
+                          it.get('emRatingName', '') or ''])
+        print(_tbl(['标题', '机构', '日期', '评级'], rrows))
+
+    print(f'\n{"=" * 70}')
+    print(' 数据源: 同花顺 hithink-finance(财报/行情/估值) + 东财(研报)')
+    print(' 以上仅供参考, 非投资建议')
+    print(f'{"=" * 70}\n')
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='快速看财报: 总览 + 三表明细(同比/环比)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''示例:
+  python quick_report.py 600941              总览
+  python quick_report.py 中国移动 -t income   利润表明细(历史+同比+环比)
+  python quick_report.py 600941 -t balance   资产负债表
+  python quick_report.py 600941 -t cashflow  现金流量表
+  python quick_report.py 600941 -t all       总览 + 三表明细
+  python quick_report.py 600941 -n 8         明细历史期数''')
+    parser.add_argument('stock', help='股票代码(如600941)或名称(如中国移动)')
+    parser.add_argument('-t', '--table', choices=['income', 'balance', 'cashflow', 'all'],
+                        default=None, help='深入查看的表(默认只看总览)')
+    parser.add_argument('-n', '--periods', type=int, default=6,
+                        help='明细历史期数, 1-20 (默认6)')
+    parser.add_argument('-s', '--scope', choices=['single', 'h1', 'fy', 'all'],
+                        default=None,
+                        help='报告口径: single(单季,3个月可比,利润/现金流默认)/h1(仅中报)/fy(仅年报)/all(期末快照,资产负债表默认)')
+    args = parser.parse_args()
+
+    if not API_KEY:
+        print('错误: 未配置同花顺 API Key')
+        print(f'  方式1: 设置环境变量 HITHINK_FINANCE_API_KEY')
+        print(f'  方式2: 在本文件同目录创建 {CONFIG_PATH.name} 内含 {{"api_key": "..."}}')
+        return
+
+    ticker, ths, name, err = resolve_stock(args.stock)
+    if err:
+        print(err)
+        return
+
+    if args.table == 'all':
+        show_overview(ths, ticker, name)
+        for k in ('income', 'balance', 'cashflow'):
+            render_statement(ths, k, args.periods, args.scope)
+    elif args.table:
+        print(f'\n{"=" * 70}')
+        print(f'  {name} ({ths})  {STATEMENTS[args.table]["name"]}明细  {datetime.now():%Y-%m-%d %H:%M}')
+        print(f'{"=" * 70}')
+        render_statement(ths, args.table, args.periods, args.scope)
+        print('\n  (看总览: 去掉 -t 直接跑)')
+        print(f'{"=" * 70}\n')
+    else:
+        show_overview(ths, ticker, name)
+        print('  深入看某张表: -t income / -t balance / -t cashflow / -t all')
+
+
+if __name__ == '__main__':
+    main()
