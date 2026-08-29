@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import plotly.graph_objects as go
 
@@ -97,6 +98,11 @@ def cached_concept_boards(ticker):
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_board_stocks(board_code):
     return qr.get_board_stocks(board_code)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_concept_graph(stock_label, boards_tuple, max_stocks):
+    return qr.build_concept_graph_html(stock_label, list(boards_tuple), max_stocks)
 
 
 REPORTS_DIR = Path(__file__).resolve().parent / 'reports' / '研报'
@@ -443,6 +449,22 @@ with tab5:
         st.info('未获取到概念板块')
     else:
         ordered = sorted(boards, key=lambda b: 0 if b.get('precise') == '1' else 1)
+
+        # ---- 类神经网络图式: 成分股(输入) → 概念(隐藏) → 本股(输出) ----
+        st.markdown('**🧠 概念网络图 Concept Network** · 左→右：成分股 → 概念 → 本股')
+        st.caption('节点可拖拽 / 滚轮缩放 / 悬浮看详情；勾选多个概念可看交叉成分股')
+        gopts = [f"{b['code']} {b['name']}" for b in ordered]
+        pick = st.multiselect('展开哪些概念（默认前5个）', gopts,
+                              default=gopts[:5], key='concept_pick')
+        if pick:
+            sel = tuple(b for b in ordered if f"{b['code']} {b['name']}" in pick)
+            html = cached_concept_graph(f'{name} ({ticker})', sel, 20)
+            st.components.v1.html(html, height=660, scrolling=True)
+        else:
+            st.caption('（未选择概念，图式不显示）')
+        st.divider()
+
+        # ---- 明细表: 板块列表 + 单板块成分股 ----
         bdf = pd.DataFrame([{'代码 Code': b['code'],
                              '板块名称 Board': b['name'],
                              '类型 Type': qr.board_type(b)} for b in ordered])

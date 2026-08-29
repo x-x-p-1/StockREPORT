@@ -435,6 +435,46 @@ def get_board_stocks(board_code, limit=200):
         return []
 
 
+def build_concept_graph_html(stock_label, boards, max_stocks=20):
+    """构建类神经网络分层图(成分股→概念→本股) → pyvis HTML 字符串
+
+    boards: [{code,name,precise,...}]；每板块取市值前 max_stocks 只成分股。
+    层级(神经网样式, 左→右): 成分股(输入) → 概念(隐藏) → 本股(输出)
+    """
+    from pyvis.network import Network
+    net = Network(height='600px', width='100%', directed=True, bgcolor='#ffffff',
+                  font_color='#333333')
+    net.add_node('stock', label=stock_label, color='#e63946', size=48, level=2,
+                 borderWidth=2, title='本股 ' + stock_label)
+    seen = set()
+    for b in boards:
+        cid = 'c' + b['code']
+        net.add_node(cid, label=b['name'], color='#457b9d', size=26, level=1,
+                     title=f'概念板块: {b["name"]}（{board_type(b)}）')
+        net.add_edge(cid, 'stock', color='#a8dadc')
+        stocks = get_board_stocks(b['code'], limit=max_stocks)
+        for s in stocks:
+            sid = 's' + s['code']
+            tip = f"{s['name']} {s['code']}"
+            if s.get('mcap'):
+                tip += f' · 总市值 {fmt_yi(s["mcap"])}'
+            if sid not in seen:
+                net.add_node(sid, label=s['name'], color='#2a9d8f', size=11,
+                             level=0, title=tip)
+                seen.add(sid)
+            net.add_edge(sid, cid, color='#cfe8df')
+    net.set_options("""{
+      "layout": {"hierarchical": {"enabled": true, "direction": "LR",
+        "levelSeparation": 320, "nodeSpacing": 110,
+        "sortMethod": "directed", "treeSpacing": 90}},
+      "physics": {"enabled": false},
+      "interaction": {"hover": true, "tooltipDelay": 120},
+      "edges": {"arrows": {"to": {"enabled": true, "scaleFactor": 0.6}},
+                "smooth": {"enabled": false}}
+    }""")
+    return net.generate_html()
+
+
 # ========== 6. 三表明细(历史多期 + 同比 + 环比) ==========
 FP_ORDER = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'FY': 4, 'Annual': 4, 'Y': 4}
 FP_NAME = {1: '一季', 2: '中报', 3: '三季', 4: '年报'}
