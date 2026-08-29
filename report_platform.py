@@ -89,6 +89,16 @@ def cached_report_detail(info_code):
     return qr.get_report_detail(info_code)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_concept_boards(ticker):
+    return qr.get_concept_boards(ticker)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_board_stocks(board_code):
+    return qr.get_board_stocks(board_code)
+
+
 REPORTS_DIR = Path(__file__).resolve().parent / 'reports' / '研报'
 
 
@@ -290,10 +300,10 @@ if err or not ths:
 st.title(f'{name}  ({ths})')
 st.caption(f'更新于 {qr.datetime.now():%Y-%m-%d %H:%M}')
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     '📋 总览 Overview', '📈 利润表 Income Statement',
     '📊 资产负债表 Balance Sheet', '💵 现金流量表 Cash Flow',
-    '📰 券商研报 Research',
+    '🧩 概念板块 Concept Boards', '📰 券商研报 Research',
 ])
 
 # ---------- Tab1 总览 Overview ----------
@@ -425,8 +435,37 @@ for st_key, (tab, title) in STATEMENT_TAB.items():
                         unit = ''
                     render_line_chart(cdf2, ['值'], f'{label} 趋势 Line Trend', unit)
 
-# ---------- Tab5 研报 ----------
+# ---------- Tab5 概念板块 ----------
 with tab5:
+    st.subheader('所属概念板块 Concept Boards（东财）')
+    boards = cached_concept_boards(ticker)
+    if not boards:
+        st.info('未获取到概念板块')
+    else:
+        ordered = sorted(boards, key=lambda b: 0 if b.get('precise') == '1' else 1)
+        bdf = pd.DataFrame([{'代码 Code': b['code'],
+                             '板块名称 Board': b['name'],
+                             '类型 Type': qr.board_type(b)} for b in ordered])
+        st.dataframe(bdf, width='stretch', hide_index=True)
+        opts = [f"{b['code']} {b['name']}（{qr.board_type(b)}）" for b in ordered]
+        choice = st.selectbox('🧩 选择板块看成分股 Constituents', opts, key='board_choice')
+        bc = choice.split(' ', 1)[0]
+        st.caption('成分股按总市值降序 · ✅=本股')
+        stocks = cached_board_stocks(bc)
+        if not stocks:
+            st.info('未获取到成分股')
+        else:
+            sdf = pd.DataFrame([{
+                '代码': s['code'], '名称': s['name'],
+                '最新价': qr.fmt_num(s['price'], 2),
+                '涨跌幅%': qr.fmt_num(s['pct'], 2),
+                '总市值(亿)': round(s['mcap'] / 1e8, 1) if s['mcap'] else '-',
+                '本股': '✅' if s['code'] == ticker else '',
+            } for s in stocks])
+            st.dataframe(sdf, width='stretch', hide_index=True)
+
+# ---------- Tab6 研报 ----------
+with tab6:
     st.subheader('最近券商研报 Research Reports（东财）')
     reports = cached_reports(ticker)
     if not reports:

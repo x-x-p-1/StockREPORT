@@ -371,6 +371,70 @@ def download_report_pdf(pdf_url, save_path):
     return False
 
 
+# ========== 5.5 概念板块(东财,免key) ==========
+def _f10_code(ticker):
+    """ticker(600941) → 东财F10代码(SH600941 / SZ000001 / BJxxxxxx)"""
+    t = str(ticker).strip().zfill(6)
+    if t.startswith(('6', '9')):
+        return 'SH' + t
+    if t.startswith(('0', '3')):
+        return 'SZ' + t
+    return 'BJ' + t
+
+
+def get_concept_boards(ticker, maxn=60):
+    """个股所属板块(概念/行业/风格/指数) → [{code,name,rank,precise}]"""
+    url = ('https://emweb.securities.eastmoney.com/PC_HSF10/CoreConception/'
+           f'PageAjax?code={_f10_code(ticker)}')
+    try:
+        r = requests.get(url, headers={'User-Agent': EM_UA}, timeout=20)
+        ss = (r.json() or {}).get('ssbk') or []
+        out = []
+        for it in ss[:maxn]:
+            out.append({
+                'code': str(it.get('BOARD_CODE', '')),
+                'name': it.get('BOARD_NAME', ''),
+                'rank': str(it.get('BOARD_RANK', '')),
+                'precise': str(it.get('IS_PRECISE') or ''),
+            })
+        return out
+    except Exception as e:
+        print(f'  [概念板块获取失败] {e}')
+        return []
+
+
+def board_type(b):
+    """板块类型: 概念(精准) / 行业指数 / 其他"""
+    p = (b or {}).get('precise', '')
+    return '概念' if p == '1' else ('行业/指数' if p == '0' else '其他')
+
+
+def get_board_stocks(board_code, limit=200):
+    """板块成分股(push2delay) → [{code,name,price,pct,mcap}], 按总市值降序
+    board_code: F10 板块代码(数字), 会补零成 4 位 BK 代码(如 714 → BK0714)"""
+    fs = f'b:BK{str(board_code).zfill(4)}'
+    params = {'pn': 1, 'pz': limit, 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2,
+              'fid': 'f20', 'fs': fs, 'fields': 'f12,f14,f2,f3,f20'}
+    try:
+        r = requests.get('https://push2delay.eastmoney.com/api/qt/clist/get',
+                         params=params,
+                         headers={'User-Agent': EM_UA,
+                                  'Referer': 'https://quote.eastmoney.com/'},
+                         timeout=20)
+        diff = ((r.json() or {}).get('data') or {}).get('diff') or []
+        out = []
+        for it in diff:
+            out.append({'code': str(it.get('f12', '')),
+                        'name': it.get('f14', ''),
+                        'price': it.get('f2'),
+                        'pct': it.get('f3'),
+                        'mcap': it.get('f20')})
+        return out
+    except Exception as e:
+        print(f'  [成分股获取失败] {e}')
+        return []
+
+
 # ========== 6. 三表明细(历史多期 + 同比 + 环比) ==========
 FP_ORDER = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'FY': 4, 'Annual': 4, 'Y': 4}
 FP_NAME = {1: '一季', 2: '中报', 3: '三季', 4: '年报'}
@@ -690,10 +754,12 @@ def main():
   python quick_report.py 600941 -t all       总览 + 三表明细
   python quick_report.py 600941 -n 8         明细历史期数''')
     parser.add_argument('stock', help='股票代码(如600941)或名称(如中国移动)')
-    parser.add_argument('-t', '--table', choices=['income', 'balance', 'cashflow', 'all'],
-                        default=None, help='深入查看的表(默认只看总览)')
+    parser.add_argument('-t', '--table', choices=['income', 'balance', 'cashflow', 'concept', 'all'],
+                        default=None, help='深入查看的表(默认只看总览); concept=所属概念板块')
     parser.add_argument('-n', '--periods', type=int, default=6,
                         help='明细历史期数, 1-20 (默认6)')
+    parser.add_argument('-b', '--board', default=None,
+                        help='配合 -t concept 使用: 查看某板块成分股(代码, 如1215)')
     parser.add_argument('-s', '--scope', choices=['single', 'h1', 'fy', 'all'],
                         default=None,
                         help='报告口径: single(单季,3个月可比,利润/现金流默认)/h1(仅中报)/fy(仅年报)/all(期末快照,资产负债表默认)')
@@ -714,6 +780,34 @@ def main():
         show_overview(ths, ticker, name)
         for k in ('income', 'balance', 'cashflow'):
             render_statement(ths, k, args.periods, args.scope)
+    elif args.table == 'concept':
+        print(f'\n{"=" * 70}')
+        print(f'  {name} ({ths})  所属概念板块  {datetime.now():%Y-%m-%d %H:%M}')
+        print(f'{"=" * 70}')
+        boards = get_concept_boards(ticker)
+        if not boards:
+            print('  (未获取到概念板块)')
+        else:
+            ordered = sorted(boards, key=lambda b: 0 if b.get('precise') == '1' else 1)
+            print(_tbl(['板块代码', '板块名称', '类型'],
+                       [[b['code'], b['name'], board_type(b)] for b in ordered]))
+            if args.board:
+                bc = str(args.board).upper()
+                if bc.startswith('BK'):
+                    bc = bc[2:]
+                stocks = get_board_stocks(bc)
+                if not stocks:
+                    print(f'  (板块 {bc} 无成分股)')
+                else:
+                    print(f'\n  [BK{bc}] 成分股(按总市值降序, 前{min(len(stocks), 30)}条):')
+                    srows = [[s['code'], s['name'],
+                              fmt_num(s['price'], 2) if s['price'] is not None else '-',
+                              fmt_pct(s['pct']) if s['pct'] is not None else '-',
+                              fmt_yi(s['mcap']) if s['mcap'] else '-',
+                              '◀本股' if s['code'] == ticker else '']
+                             for s in stocks[:30]]
+                    print(_tbl(['代码', '名称', '最新价', '涨跌幅', '总市值', ''], srows))
+        print(f'{"=" * 70}\n')
     elif args.table:
         print(f'\n{"=" * 70}')
         print(f'  {name} ({ths})  {STATEMENTS[args.table]["name"]}明细  {datetime.now():%Y-%m-%d %H:%M}')

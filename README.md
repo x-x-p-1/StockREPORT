@@ -13,6 +13,7 @@
 - **自动派生字段**：毛利、毛利率、研发费用率（利润表）；资产负债率（资产负债表）
 - **代码 / 名称双输入**：`600941` 或 `中国移动` 都能识别，自动消歧
 - **健壮性**：429 限流指数退避重试；财务指标滞后时自动回退到最近可用报告期；兼容年报 `FY` 字段
+- **概念板块**：查个股所属概念/行业板块，点开某板块看**全部成分股**（代码/名称/最新价/涨跌幅/总市值，按市值降序）
 
 ## 环境与依赖
 
@@ -56,6 +57,10 @@ python quick_report.py 600941 -t income              # 单季 QoQ（默认）
 python quick_report.py 600941 -t income -s h1        # 仅历年 H1，同比=去年同期
 python quick_report.py 600941 -t income -s fy        # 仅历年年报，同比=去年同期
 python quick_report.py 600941 -t balance -s all      # 资产负债表期末快照（默认）
+
+# 概念板块
+python quick_report.py 600941 -t concept             # 所属概念/行业板块列表
+python quick_report.py 600941 -t concept -b 714      # 某板块(BK0714=5G概念)成分股
 ```
 
 ## 财报分析平台（Streamlit）
@@ -67,7 +72,8 @@ streamlit run report_platform.py
 # 浏览器打开 http://localhost:8502
 ```
 
-- 左侧搜索框输入**代码或名称**，右侧 5 个 Tab：总览 / 利润表 / 资产负债表 / 现金流量表 / 券商研报
+- 左侧搜索框输入**代码或名称**，右侧 6 个 Tab：总览 / 利润表 / 资产负债表 / 现金流量表 / 概念板块 / 券商研报
+- **概念板块 Tab**：展示个股所属全部概念/行业板块（概念排前），下拉选某板块 → 出该板块**全部成分股**（最新价/涨跌幅/总市值，✅标记本股，按市值降序）
 - **中英双语**：专业名词（科目、指标、行情、Tab）均带英文，方便对照国外资料
 - **同口径对比**：利润/现金流是累计口径，混排会失真 → 默认「单季」(每列3个月可比)，可切换「中报 H1」「年报 FY」看同口径同比；资产负债表为时点快照默认「期末全部」
 - **图表优先**：总览含 单季动能、中报同口径同比、毛利率/净利率趋势、费用率趋势 4 张图；三表 Tab 图表演示在前、明细表折叠可展开
@@ -104,6 +110,7 @@ streamlit run report_platform.py
 |---|---|---|---|
 | 行情 / 估值 / 三表 / 财务指标 | 同花顺 `fuyao.aicubes.cn` | 需要 | 官方 API，有配额；已内置 0.6s 节流 + 429 退避 |
 | 券商研报 | 东方财富 `reportapi.eastmoney.com` | 免 key | 列表 + 评级，仅供学习研究 |
+| 概念板块 / 成分股 | 东方财富 F10 + `push2delay.eastmoney.com` | 免 key | 所属板块 + 板块成分股（按市值） |
 
 同花顺接口**不提供**：研报原文、分钟 K、tick、宏观数据、新闻公告原文。
 
@@ -121,8 +128,9 @@ streamlit run report_platform.py
 
 | 文件 | 说明 |
 |---|---|
-| `quick_report.py` | 主工具（命令行：总览 + 三表明细） |
+| `quick_report.py` | 主工具（命令行：总览 + 三表明细 + 概念板块） |
 | `report_platform.py` | 财报分析平台（Streamlit Web 界面） |
+| `requirements.txt` | Python 依赖（`pip install -r requirements.txt`） |
 | `hithink_config.json` | 同花顺 API Key（已 gitignore） |
 | `.gitignore` | 排除 Key 等敏感文件 |
 | `crawl_top300.py` 等 | 本目录原有的财报爬虫脚本 |
