@@ -35,6 +35,34 @@
 
 > ⚠️ `hithink_config.json` 含明文 Key，已在 `.gitignore` 中排除，**不要提交到 Git**。
 
+## 给使用者：提前配置（clone 后只改一个文件）
+
+平台支持**统一配置文件 `config.json`**（模板 `config.example.json`，已 gitignore，勿提交）。优先级：**环境变量 > `config.json` > 默认值**。
+
+```bash
+# 把模板复制成自己的配置
+cp config.example.json config.json
+```
+
+`config.json` 可配置项：
+
+| 配置项 | 说明 | 默认值 | 环境变量 |
+|---|---|---|---|
+| `api_key` | 同花顺 Key（也可用 `hithink_config.json` 或环境变量） | 空 → 走 hithink_config | `HITHINK_FINANCE_API_KEY` |
+| `reports_dir` | **研报 PDF 下载目录**（提前指定，不写就用项目内 `reports/研报/`） | `reports/研报/` | `STOCKREPORT_REPORTS_DIR` |
+| `default_periods` | 平台默认历史期数 | `8` | `STOCKREPORT_DEFAULT_PERIODS` |
+
+示例（下载到 D 盘固定文件夹、默认看 12 期）：
+```json
+{
+  "api_key": "sk-fuyao-xxxx",
+  "reports_dir": "D:/研报下载",
+  "default_periods": 12
+}
+```
+
+> 💡 研报 PDF 去重下载：已下载过的会在 `reports_dir` 里检查，不重复下载。
+
 ## 用法
 
 ```bash

@@ -66,6 +66,26 @@ if not API_KEY and CONFIG_PATH.exists():
 if not API_KEY:
     API_KEY = getpass.getpass('请输入同花顺 API Key: ')
 
+# ========== 平台配置加载 (config.json, 可被环境变量覆盖) ==========
+_APP_DIR = Path(__file__).resolve().parent
+_CFG = {}
+_cfg_path = _APP_DIR / 'config.json'
+if _cfg_path.exists():
+    try:
+        _CFG = json.loads(_cfg_path.read_text(encoding='utf-8')) or {}
+    except Exception:
+        _CFG = {}
+
+
+def cfg_get(key, default=None):
+    """取配置: 环境变量 > config.json > 默认值"""
+    env_map = {'api_key': 'HITHINK_FINANCE_API_KEY', 'reports_dir': 'STOCKREPORT_REPORTS_DIR',
+               'default_periods': 'STOCKREPORT_DEFAULT_PERIODS'}
+    env = env_map.get(key)
+    if env and os.environ.get(env):
+        return os.environ[env]
+    return _CFG.get(key, default)
+
 # ========== 工具函数 ==========
 def ths_get(path, params, retries=4):
     """同花顺 GET, 带节流 + 429 退避重试"""

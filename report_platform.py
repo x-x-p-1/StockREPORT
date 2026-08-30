@@ -105,7 +105,9 @@ def cached_concept_graph(stock_label, boards_tuple, max_stocks):
     return qr.build_concept_graph_html(stock_label, list(boards_tuple), max_stocks)
 
 
-REPORTS_DIR = Path(__file__).resolve().parent / 'reports' / '研报'
+REPORTS_DIR = Path(qr.cfg_get('reports_dir') or
+                     (Path(__file__).resolve().parent / 'reports' / '研报'))
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _report_pdf_path(title):
@@ -304,7 +306,8 @@ with st.sidebar:
     st.title(APP_TITLE)
     st.caption(APP_HINT)
     q = st.text_input('🔍 股票代码或名称', value='中国移动')
-    limit = st.slider('历史期数', min_value=2, max_value=20, value=8, step=1)
+    limit = st.slider('历史期数', min_value=2, max_value=20,
+                      value=int(qr.cfg_get('default_periods', 8)), step=1)
     go_btn = st.button('查询', type='primary', use_container_width=True)
     st.divider()
     st.caption('口径说明：利润/现金流默认单季(3个月可比)')
