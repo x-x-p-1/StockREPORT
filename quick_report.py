@@ -548,6 +548,94 @@ window.addEventListener('load', function(){
 </script>
 """
 
+# 概念图动态效果: 入场浮现 + 悬停邻居高亮/其余淡出(平滑缓动)
+_DYNAMIC_JS_TEMPLATE = r"""
+<script>
+(function(){
+  var net = null;
+  function baseSize(id){
+    var s = String(id).charAt(0);
+    return s === 's' ? 7 : (s === 'c' ? 26 : 46);
+  }
+  function applySmooth(updates, ms){
+    var t0 = performance.now();
+    function step(){
+      var p = Math.min(1, (performance.now()-t0)/ms);
+      var e = 1 - Math.pow(1-p, 3);
+      var nodes = net.body.data.nodes;
+      for(var i=0;i<updates.length;i++){
+        var u = updates[i], n = nodes.get(u.id);
+        if(!n) continue;
+        nodes.update({id:u.id,
+          size: u.from.size + (u.to.size-u.from.size)*e,
+          opacity: u.from.opacity + (u.to.opacity-u.from.opacity)*e});
+      }
+      if(p < 1) setTimeout(step, 16);
+    }
+    setTimeout(step, 16);
+  }
+  function neighborsOf(id){
+    var out = {}; out[id] = 1;
+    var es = net.body.data.edges.get();
+    for(var i=0;i<es.length;i++){ var e=es[i];
+      if(e.from===id){ out[e.to]=1; } if(e.to===id){ out[e.from]=1; } }
+    return out;
+  }
+  function dimOthers(centerId){
+    var nb = neighborsOf(centerId);
+    var updates = [];
+    var nodes = net.body.data.nodes.get();
+    for(var i=0;i<nodes.length;i++){
+      var n = nodes[i];
+      if(n.id === centerId) continue;
+      var from = {size:n.size, opacity:(n.opacity==null?1:n.opacity)};
+      if(nb[n.id]){ updates.push({id:n.id, from:from, to:{size:from.size*1.25, opacity:1}}); }
+      else { updates.push({id:n.id, from:from, to:{size:from.size*0.85, opacity:0.15}}); }
+    }
+    var hn = net.body.data.nodes.get(centerId);
+    if(hn){ updates.push({id:centerId, from:{size:hn.size, opacity:(hn.opacity==null?1:hn.opacity)},
+                          to:{size:Math.min(hn.size*1.6, 70), opacity:1}}); }
+    applySmooth(updates, 260);
+  }
+  function restore(){
+    var updates = [];
+    var nodes = net.body.data.nodes.get();
+    for(var i=0;i<nodes.length;i++){
+      var n = nodes[i];
+      var bs = baseSize(n.id);
+      var op = (n.opacity==null?1:n.opacity);
+      if(Math.abs(n.size-bs) > 0.5 || op < 0.99){
+        updates.push({id:n.id, from:{size:n.size, opacity:op}, to:{size:bs, opacity:1}});
+      }
+    }
+    if(updates.length) applySmooth(updates, 260);
+  }
+  function entrance(){
+    var nodes = net.body.data.nodes.get();
+    var comps = [];
+    for(var i=0;i<nodes.length;i++){
+      if(String(nodes[i].id).charAt(0) === 's'){ comps.push(nodes[i].id); }
+    }
+    var t0 = performance.now();
+    function step(){
+      var p = Math.min(1, (performance.now()-t0)/1000);
+      for(var i=0;i<comps.length;i++){
+        net.body.data.nodes.update({id:comps[i], opacity:p, size:1+p*6});
+      }
+      if(p < 1) setTimeout(step, 16);
+    }
+    setTimeout(step, 16);
+  }
+  window.addEventListener('load', function(){
+    net = window.network; if(!net) return;
+    setTimeout(entrance, 120);
+    net.on('hoverNode', function(p){ if(p && p.node) dimOthers(p.node); });
+    net.on('blurNode', restore);
+  });
+})();
+</script>
+"""
+
 
 def build_concept_graph_html(stock_label, boards, max_stocks=15, max_label=15):
     """概念网络图(connected-papers 风格) → pyvis HTML
@@ -648,7 +736,7 @@ def build_concept_graph_html(stock_label, boards, max_stocks=15, max_label=15):
     # 点击概念节点 → iframe 内弹出该概念成分股面板(数据内嵌, 自包含)
     board_json = _json.dumps(board_data, ensure_ascii=False)
     panel_js = _PANEL_JS_TEMPLATE.replace('__BOARD_JSON__', board_json)
-    return html.replace('</body>', legend_html + panel_js + '</body>')
+    return html.replace('</body>', legend_html + panel_js + _DYNAMIC_JS_TEMPLATE + '</body>')
     return html.replace('</body>', legend_html + panel_js + '</body>')
 
 
