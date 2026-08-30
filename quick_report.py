@@ -502,44 +502,104 @@ def get_board_stocks(board_code, limit=200):
         return []
 
 
-def build_concept_graph_html(stock_label, boards, max_stocks=20):
-    """构建类神经网络分层图(成分股→概念→本股) → pyvis HTML 字符串
+_CONCEPT_PALETTE = ['#e63946', '#2a9d8f', '#3a86ff', '#e9c46a', '#8e7cc3',
+                    '#f4a261', '#5fad56', '#fb8500', '#6d597a', '#457b9d']
 
-    boards: [{code,name,precise,...}]；每板块取市值前 max_stocks 只成分股。
-    层级(神经网样式, 左→右): 成分股(输入) → 概念(隐藏) → 本股(输出)
+
+def build_concept_graph_html(stock_label, boards, max_stocks=12, max_label=15):
+    """概念网络图(connected-papers 风格) → pyvis HTML
+
+    力导向布局(forceAtlas2) + 按概念聚类配色 + 悬停高亮邻居 + 平滑曲线。
+    boards: [{code,name,...}]；每板块取市值前 max_stocks 只；全图市值前 max_label 只显示标签。
     """
+    import json as _json
     from pyvis.network import Network
-    net = Network(height='600px', width='100%', directed=True, bgcolor='#ffffff',
-                  font_color='#333333')
-    net.add_node('stock', label=stock_label, color='#e63946', size=48, level=2,
-                 borderWidth=2, title='本股 ' + stock_label)
-    seen = set()
+    net = Network(height='680px', width='100%', directed=False, bgcolor='#ffffff',
+                  font_color='#1f2937')
+    bname = {b['code']: b['name'] for b in boards}
+    bcolor = {b['code']: _CONCEPT_PALETTE[i % len(_CONCEPT_PALETTE)]
+              for i, b in enumerate(boards)}
+
+    # 本股(居中大节点)
+    root_col = bcolor[boards[0]['code']] if boards else '#e63946'
+    net.add_node('stock', label=stock_label,
+                 color={'background': root_col, 'border': '#7f1d1d'},
+                 size=46, borderWidth=3, group='本股', title=stock_label,
+                 font={'size': 20, 'color': '#7f1d1d'})
+    # 概念节点(各自色系)
     for b in boards:
         cid = 'c' + b['code']
-        net.add_node(cid, label=b['name'], color='#457b9d', size=26, level=1,
-                     title=f'概念板块: {b["name"]}（{board_type(b)}）')
-        net.add_edge(cid, 'stock', color='#a8dadc')
-        stocks = get_board_stocks(b['code'], limit=max_stocks)
-        for s in stocks:
+        col = bcolor[b['code']]
+        net.add_node(cid, label=b['name'],
+                     color={'background': col, 'border': '#ffffff'},
+                     size=26, borderWidth=2, group=b['name'],
+                     title=f'概念板块: {b["name"]}（{board_type(b)}）',
+                     font={'size': 14, 'color': col})
+        net.add_edge(cid, 'stock', width=1.0, color='#cbd5e1')
+    # 成分股(归到所属概念的颜色, 聚成团)
+    seen = {}
+    for b in boards:
+        for s in get_board_stocks(b['code'], limit=max_stocks):
             sid = 's' + s['code']
-            tip = f"{s['name']} {s['code']}"
-            if s.get('mcap'):
-                tip += f' · 总市值 {fmt_yi(s["mcap"])}'
-            if sid not in seen:
-                net.add_node(sid, label=s['name'], color='#2a9d8f', size=11,
-                             level=0, title=tip)
-                seen.add(sid)
-            net.add_edge(sid, cid, color='#cfe8df')
-    net.set_options("""{
-      "layout": {"hierarchical": {"enabled": true, "direction": "LR",
-        "levelSeparation": 320, "nodeSpacing": 110,
-        "sortMethod": "directed", "treeSpacing": 90}},
-      "physics": {"enabled": false},
-      "interaction": {"hover": true, "tooltipDelay": 120},
-      "edges": {"arrows": {"to": {"enabled": true, "scaleFactor": 0.6}},
-                "smooth": {"enabled": false}}
-    }""")
-    return net.generate_html()
+            rec = seen.setdefault(sid, {'name': s['name'], 'mcap': s.get('mcap'),
+                                        'code': s['code'], 'board': b['code'],
+                                        'boards': []})
+            rec['boards'].append(b['code'])
+    ranked = sorted(seen.values(), key=lambda x: -(x['mcap'] or 0))
+    top_names = {x['name'] for x in ranked[:max_label]}
+    for sid, info in seen.items():
+        col = bcolor.get(info['board'], '#94a3b8')
+        net.add_node(sid, label=(info['name'] if info['name'] in top_names else ''),
+                     color={'background': col, 'border': '#ffffff',
+                            'highlight': {'background': col, 'border': '#1f2937'}},
+                     size=7, borderWidth=1, group=bname.get(info['board'], '成分股'),
+                     title=f"{info['name']} {info['code']}"
+                           + (f' · 总市值 {fmt_yi(info["mcap"])}' if info.get('mcap') else ''),
+                     font={'size': 10, 'color': '#475569'})
+        for bc in info['boards']:
+            net.add_edge(sid, 'c' + bc, width=0.6, color='#e2e8f0')
+
+    legend_groups = None  # (图例改手动注入 HTML)
+
+    options = {
+        'physics': {'solver': 'forceAtlas2Based',
+                    'forceAtlas2Based': {'gravitationalConstant': -40,
+                                         'centralGravity': 0.012,
+                                         'springLength': 100,
+                                         'springConstant': 0.08,
+                                         'damping': 0.4,
+                                         'avoidOverlap': 0.2},
+                    'stabilization': {'enabled': True, 'iterations': 400,
+                                      'updateInterval': 20}},
+        'interaction': {'hover': True, 'hoverConnectedEdges': True,
+                        'tooltipDelay': 120, 'navigationButtons': False},
+        'edges': {'smooth': {'type': 'continuous', 'roundness': 0.5},
+                  'color': {'color': '#d1d5db', 'highlight': '#1f2937',
+                            'hover': '#1f2937'},
+                  'width': 0.8},
+        'nodes': {'shape': 'dot', 'shadow': False,
+                  'font': {'face': 'Microsoft YaHei', 'size': 12,
+                           'color': '#374151'}},
+    }
+    net.set_options(_json.dumps(options, ensure_ascii=False))
+    html = net.generate_html()
+    # 手动图例(vis.js 新版已移除 legend 选项)
+    legend_items = ('<div style="display:flex;align-items:center">'
+                    f'<span style="width:11px;height:11px;border-radius:50%;'
+                    f'background:{root_col};margin-right:6px;flex:none"></span>本股</div>')
+    for b in boards:
+        legend_items += (
+            '<div style="margin-top:2px;display:flex;align-items:center">'
+            f'<span style="width:11px;height:11px;border-radius:50%;'
+            f'background:{bcolor[b["code"]]};margin-right:6px;flex:none"></span>'
+            f'{b["name"]}</div>')
+    legend_html = (
+        '<div style="position:fixed;right:12px;bottom:12px;z-index:99;'
+        'background:rgba(255,255,255,.95);border:1px solid #e5e7eb;'
+        'border-radius:10px;padding:8px 12px;font:12px \'Microsoft YaHei\';'
+        'color:#374151;box-shadow:0 2px 8px rgba(0,0,0,.08);line-height:1.7">'
+        + legend_items + '</div>')
+    return html.replace('</body>', legend_html + '</body>')
 
 
 # ========== 8. 因子画像(大师关注点 → A股因子) ==========
