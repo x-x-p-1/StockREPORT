@@ -756,6 +756,8 @@ with tab8:
 
         # ---- ③ 自身历史分位 ----
         st.markdown('**③ 自身历史：近5年 PE/PB 分位（当前处于什么位置）**')
+        st.caption('ℹ️ 此部分只跟该股**自身历史**比，与上方基准板块无关——'
+                   '切换行业/概念只影响 ①横向 和 ②可比组，本股 PE/PB 与历史分位不变')
 
         def _hpos(cur, qs):
             if cur is None or not qs:
