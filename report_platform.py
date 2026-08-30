@@ -115,6 +115,34 @@ def _report_pdf_path(title):
     return REPORTS_DIR / f'{safe}.pdf'
 
 
+def _safe_stem(title):
+    return re.sub(r'[\\/:*?"<>|]', '', title or '')[:80] or 'report'
+
+
+@st.dialog('⬇️ 下载研报 PDF · 指定保存位置')
+def download_report_dialog(title, pdf_url):
+    """弹窗: 输入保存文件夹(记住上次位置), 确认后下载"""
+    default_dir = str(st.session_state.get('last_dl_dir') or REPORTS_DIR)
+    st.caption(f'**{title}**')
+    d = st.text_input('保存文件夹（绝对路径，如 D:/研报下载）', value=default_dir)
+    if st.button('✅ 确认下载', type='primary'):
+        d = (d or '').strip()
+        if not d:
+            st.error('请输入保存目录')
+        else:
+            try:
+                p = Path(d) / f'{_safe_stem(title)}.pdf'
+                if qr.download_report_pdf(pdf_url, p):
+                    st.session_state['last_dl_dir'] = str(Path(d))
+                    st.success(f'已保存：`{p}`')
+                else:
+                    st.error('下载失败（反爬校验未通过）')
+            except Exception as e:
+                st.error(f'下载失败：{e}')
+    if st.button('取消'):
+        st.rerun()
+
+
 # ========== 数据组装（同口径） ==========
 SCOPE_NAMES = {'single': '单季 QoQ (3个月)', 'h1': '中报 H1 同口径',
                'fy': '年报 FY 同口径', 'all': '期末快照 All (时点)'}
@@ -538,15 +566,12 @@ with tab6:
         else:
             st.caption('（未抓到摘要）')
         if pdf:
-            path = _report_pdf_path(title)
-            if path.exists():
-                st.success(f'✅ 该篇已下载过：`{path.name}`（不再重复下载）')
-            elif st.button('⬇️ 下载这篇 PDF', type='primary'):
-                if qr.download_report_pdf(pdf, path):
-                    st.success(f'已保存：`{path}`')
-                    st.rerun()
-                else:
-                    st.error('下载失败')
+            _dl_dir = str(st.session_state.get('last_dl_dir') or REPORTS_DIR)
+            _p = Path(_dl_dir) / f'{_safe_stem(title)}.pdf'
+            if _p.exists():
+                st.success(f'✅ 该篇已下载过：`{_p}`（可重新选位置下载）')
+            if st.button('⬇️ 下载这篇 PDF', type='primary'):
+                download_report_dialog(title, pdf)
         else:
             st.caption('（无 PDF 链接）')
 
