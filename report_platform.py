@@ -105,18 +105,28 @@ def cached_concept_graph(stock_label, boards_tuple, max_stocks):
     return qr.build_concept_graph_html(stock_label, list(boards_tuple), max_stocks)
 
 
-def _board_stocks_df(board_code, ticker):
-    """板块成分股 DataFrame(按市值降序, ✅=本股), 无数据返回 None"""
-    stocks = cached_board_stocks(board_code)
+@st.cache_data(ttl=3600, show_spinner='正在取成分股财务数据(市值前12, 同花顺)...')
+def cached_board_financials(board_code, ticker):
+    """板块成分股财务表: 市值/PE/PB(东财, 全量) + 毛利率/营收增速/净利增速/ROE(同花顺, 市值前12)"""
+    stocks = qr.get_board_stocks(board_code, limit=200)
     if not stocks:
         return None
-    return pd.DataFrame([{
-        '代码': s['code'], '名称': s['name'],
-        '最新价': qr.fmt_num(s['price'], 2),
-        '涨跌幅%': qr.fmt_num(s['pct'], 2),
-        '总市值(亿)': round(s['mcap'] / 1e8, 1) if s['mcap'] else '-',
-        '本股': '✅' if s['code'] == ticker else '',
-    } for s in stocks])
+    top = sorted(stocks, key=lambda s: -(s.get('mcap') or 0))[:12]
+    rows = []
+    for s in top:
+        ths = qr._guess_thscode(s['code'])
+        fin = qr.get_financial_core(ths) if ths else None
+        rows.append({
+            '名称': s['name'],
+            '总市值(亿)': round(s['mcap'] / 1e8, 1) if s.get('mcap') else None,
+            'PE(动)': round(s['pe'], 1) if s.get('pe') else None,
+            'PB': round(s['pb'], 1) if s.get('pb') else None,
+            '毛利率%': (fin or {}).get('gross_margin'),
+            '营收增速%': (fin or {}).get('rev_yoy'),
+            '净利增速%': (fin or {}).get('np_yoy'),
+            'ROE%': (fin or {}).get('roe'),
+        })
+    return pd.DataFrame(rows) if rows else None
 
 
 REPORTS_DIR = Path(qr.cfg_get('reports_dir') or
@@ -534,12 +544,22 @@ with tab5:
         opts = [f"{b['code']} {b['name']}（{qr.board_type(b)}）" for b in ordered]
         choice = st.selectbox('🧩 选择板块看成分股 Constituents', opts, key='board_choice')
         bc = choice.split(' ', 1)[0]
-        st.caption('成分股按总市值降序 · ✅=本股')
-        sdf = _board_stocks_df(bc, ticker)
-        if sdf is None:
+        fdf = cached_board_financials(bc, ticker)
+        if fdf is None or fdf.empty:
             st.info('未获取到成分股')
         else:
+            num_cols = [c for c in fdf.columns if c != '名称']
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                sort_col = st.selectbox('📊 按指标排序 Sort by', num_cols,
+                                        index=num_cols.index('总市值(亿)'), key='fin_sort')
+            with c2:
+                asc = st.radio('方向 Order', ['降序 Desc', '升序 Asc'],
+                               index=0, horizontal=True, key='fin_asc')
+            sdf = fdf.sort_values(sort_col, ascending=(asc == '升序 Asc'),
+                                  na_position='last')
             st.dataframe(sdf, width='stretch', hide_index=True)
+            st.caption('市值/PE/PB 来自东财；毛利率/营收增速/净利增速/ROE 取市值前12(同花顺，逐个调接口首次稍慢)')
 
 # ---------- Tab6 研报 ----------
 with tab6:

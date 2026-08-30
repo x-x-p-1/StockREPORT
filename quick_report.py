@@ -339,6 +339,22 @@ def get_indicators_latest(thscode):
     return None, {}, '财务指标暂不可用(报告期未算好或超配额)'
 
 
+def get_financial_core(thscode):
+    """单股核心财务(同花顺): {gross_margin, rev_yoy, np_yoy, roe}; 失败返回 None
+    从五类财务指标里取 毛利率/营收同比/归母净利同比/加权ROE"""
+    _report, abilities, _err = get_indicators_latest(thscode)
+    if not abilities:
+        return None
+    out = {'gross_margin': None, 'rev_yoy': None, 'np_yoy': None, 'roe': None}
+    targets = {'销售毛利率': 'gross_margin', '营收同比': 'rev_yoy',
+               '归母净利同比': 'np_yoy', '加权ROE': 'roe'}
+    for ab in abilities.values():
+        for k, v in ab.items():
+            if k in targets and out[targets[k]] is None:
+                out[targets[k]] = v
+    return out
+
+
 # ========== 5. 东财研报(免key) ==========
 def get_reports_eastmoney(ticker, page_size=8, begin='2025-01-01'):
     """东财 reportapi 个股研报列表"""
