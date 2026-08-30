@@ -505,12 +505,56 @@ def get_board_stocks(board_code, limit=200):
 _CONCEPT_PALETTE = ['#e63946', '#2a9d8f', '#3a86ff', '#e9c46a', '#8e7cc3',
                     '#f4a261', '#5fad56', '#fb8500', '#6d597a', '#457b9d']
 
+# 概念图: 点击概念节点 → iframe 内弹出该概念成分股面板的 JS 模板
+# __BOARD_JSON__ 会被替换为 {code: {name, stocks}} JSON
+_PANEL_JS_TEMPLATE = r"""
+<script>
+window.BOARD_STOCKS = __BOARD_JSON__;
+var __panel = null;
+function __fyi(v){ if(v==null)return '-'; v=Number(v);
+  if(Math.abs(v)>=1e12)return (v/1e12).toFixed(2)+'万亿';
+  if(Math.abs(v)>=1e8)return (v/1e8).toFixed(1)+'亿';
+  return v.toFixed(0); }
+function __showPanel(code,name){
+  if(__panel){ __panel.remove(); }
+  var d = window.BOARD_STOCKS[code]; if(!d) return;
+  var rows = d.stocks.map(function(s){
+    return '<tr><td style="padding:3px 8px;border-bottom:1px solid #f1f5f9">'+s[1]+'</td>'
+      + '<td style="padding:3px 8px;border-bottom:1px solid #f1f5f9;color:#64748b">'+s[0]+'</td>'
+      + '<td style="padding:3px 8px;border-bottom:1px solid #f1f5f9;text-align:right;color:#334155">'+__fyi(s[4])+'</td></tr>';
+  }).join('');
+  __panel = document.createElement('div');
+  __panel.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:99;width:310px;'
+    + 'max-height:62%;overflow:auto;background:rgba(255,255,255,.98);border:1px solid #e2e8f0;'
+    + 'border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12);font:12px "Microsoft YaHei";color:#1f2937';
+  __panel.innerHTML = '<div style="padding:8px 12px;font-weight:700;color:#0f172a;'
+    + 'border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center">'
+    + name + '（前' + d.stocks.length + '大市值）'
+    + '<span style="cursor:pointer;color:#94a3b8" onclick="__hidePanel()">✕</span></div>'
+    + '<table style="width:100%;border-collapse:collapse"><tbody>' + rows + '</tbody></table>';
+  document.body.appendChild(__panel);
+}
+function __hidePanel(){ if(__panel){ __panel.remove(); __panel=null; } }
+window.addEventListener('load', function(){
+  var net = window.network; if(!net) return;
+  net.on('click', function(p){
+    var ids = p && p.nodes;
+    if(ids && ids.length){
+      var id = ids[0], n = net.body.data.nodes.get(id);
+      if(n && id.indexOf('c') === 0){ __showPanel(id.substring(1), n.label); }
+    }
+  });
+});
+</script>
+"""
 
-def build_concept_graph_html(stock_label, boards, max_stocks=12, max_label=15):
+
+def build_concept_graph_html(stock_label, boards, max_stocks=15, max_label=15):
     """概念网络图(connected-papers 风格) → pyvis HTML
 
     力导向布局(forceAtlas2) + 按概念聚类配色 + 悬停高亮邻居 + 平滑曲线。
     boards: [{code,name,...}]；每板块取市值前 max_stocks 只；全图市值前 max_label 只显示标签。
+    点击概念节点 → iframe 内弹出该概念成分股面板(数据内嵌, 自包含)。
     """
     import json as _json
     from pyvis.network import Network
@@ -519,6 +563,7 @@ def build_concept_graph_html(stock_label, boards, max_stocks=12, max_label=15):
     bname = {b['code']: b['name'] for b in boards}
     bcolor = {b['code']: _CONCEPT_PALETTE[i % len(_CONCEPT_PALETTE)]
               for i, b in enumerate(boards)}
+    board_data = {}          # code -> {name, stocks: [[code,name,price,pct,mcap],...]}
 
     # 本股(居中大节点)
     root_col = bcolor[boards[0]['code']] if boards else '#e63946'
@@ -536,10 +581,13 @@ def build_concept_graph_html(stock_label, boards, max_stocks=12, max_label=15):
                      title=f'概念板块: {b["name"]}（{board_type(b)}）',
                      font={'size': 14, 'color': col})
         net.add_edge(cid, 'stock', width=1.0, color='#cbd5e1')
+        board_data[b['code']] = {'name': b['name'], 'stocks': []}
     # 成分股(归到所属概念的颜色, 聚成团)
     seen = {}
     for b in boards:
         for s in get_board_stocks(b['code'], limit=max_stocks):
+            board_data[b['code']]['stocks'].append(
+                [str(s['code']), s['name'], s.get('price'), s.get('pct'), s.get('mcap')])
             sid = 's' + s['code']
             rec = seen.setdefault(sid, {'name': s['name'], 'mcap': s.get('mcap'),
                                         'code': s['code'], 'board': b['code'],
@@ -559,8 +607,6 @@ def build_concept_graph_html(stock_label, boards, max_stocks=12, max_label=15):
         for bc in info['boards']:
             net.add_edge(sid, 'c' + bc, width=0.6, color='#e2e8f0')
 
-    legend_groups = None  # (图例改手动注入 HTML)
-
     options = {
         'physics': {'solver': 'forceAtlas2Based',
                     'forceAtlas2Based': {'gravitationalConstant': -40,
@@ -569,7 +615,7 @@ def build_concept_graph_html(stock_label, boards, max_stocks=12, max_label=15):
                                          'springConstant': 0.08,
                                          'damping': 0.4,
                                          'avoidOverlap': 0.2},
-                    'stabilization': {'enabled': True, 'iterations': 400,
+                    'stabilization': {'enabled': True, 'iterations': 250,
                                       'updateInterval': 20}},
         'interaction': {'hover': True, 'hoverConnectedEdges': True,
                         'tooltipDelay': 120, 'navigationButtons': False},
@@ -599,7 +645,11 @@ def build_concept_graph_html(stock_label, boards, max_stocks=12, max_label=15):
         'border-radius:10px;padding:8px 12px;font:12px \'Microsoft YaHei\';'
         'color:#374151;box-shadow:0 2px 8px rgba(0,0,0,.08);line-height:1.7">'
         + legend_items + '</div>')
-    return html.replace('</body>', legend_html + '</body>')
+    # 点击概念节点 → iframe 内弹出该概念成分股面板(数据内嵌, 自包含)
+    board_json = _json.dumps(board_data, ensure_ascii=False)
+    panel_js = _PANEL_JS_TEMPLATE.replace('__BOARD_JSON__', board_json)
+    return html.replace('</body>', legend_html + panel_js + '</body>')
+    return html.replace('</body>', legend_html + panel_js + '</body>')
 
 
 # ========== 8. 因子画像(大师关注点 → A股因子) ==========

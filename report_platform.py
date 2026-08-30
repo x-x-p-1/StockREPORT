@@ -105,6 +105,20 @@ def cached_concept_graph(stock_label, boards_tuple, max_stocks):
     return qr.build_concept_graph_html(stock_label, list(boards_tuple), max_stocks)
 
 
+def _board_stocks_df(board_code, ticker):
+    """板块成分股 DataFrame(按市值降序, ✅=本股), 无数据返回 None"""
+    stocks = cached_board_stocks(board_code)
+    if not stocks:
+        return None
+    return pd.DataFrame([{
+        '代码': s['code'], '名称': s['name'],
+        '最新价': qr.fmt_num(s['price'], 2),
+        '涨跌幅%': qr.fmt_num(s['pct'], 2),
+        '总市值(亿)': round(s['mcap'] / 1e8, 1) if s['mcap'] else '-',
+        '本股': '✅' if s['code'] == ticker else '',
+    } for s in stocks])
+
+
 REPORTS_DIR = Path(qr.cfg_get('reports_dir') or
                      (Path(__file__).resolve().parent / 'reports' / '研报'))
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -500,14 +514,14 @@ with tab5:
 
         # ---- 类神经网络图式: 成分股(输入) → 概念(隐藏) → 本股(输出) ----
         st.markdown('**🧠 概念网络图 Concept Network** · 左→右：成分股 → 概念 → 本股')
-        st.caption('节点可拖拽 / 滚轮缩放 / 悬浮看详情；勾选多个概念可看交叉成分股')
+        st.caption('节点可拖拽 / 滚轮缩放 / 悬浮看详情；**点击概念圆圈 → 弹出该概念成分股面板**；勾选多个概念可看交叉成分股')
         gopts = [f"{b['code']} {b['name']}" for b in ordered]
         pick = st.multiselect('展开哪些概念（默认前5个）', gopts,
                               default=gopts[:5], key='concept_pick')
         if pick:
             sel = tuple(b for b in ordered if f"{b['code']} {b['name']}" in pick)
-            html = cached_concept_graph(f'{name} ({ticker})', sel, 12)
-            st.components.v1.html(html, height=660, scrolling=True)
+            html = cached_concept_graph(f'{name} ({ticker})', sel, 15)
+            st.components.v1.html(html, height=680, scrolling=True)
         else:
             st.caption('（未选择概念，图式不显示）')
         st.divider()
@@ -521,17 +535,10 @@ with tab5:
         choice = st.selectbox('🧩 选择板块看成分股 Constituents', opts, key='board_choice')
         bc = choice.split(' ', 1)[0]
         st.caption('成分股按总市值降序 · ✅=本股')
-        stocks = cached_board_stocks(bc)
-        if not stocks:
+        sdf = _board_stocks_df(bc, ticker)
+        if sdf is None:
             st.info('未获取到成分股')
         else:
-            sdf = pd.DataFrame([{
-                '代码': s['code'], '名称': s['name'],
-                '最新价': qr.fmt_num(s['price'], 2),
-                '涨跌幅%': qr.fmt_num(s['pct'], 2),
-                '总市值(亿)': round(s['mcap'] / 1e8, 1) if s['mcap'] else '-',
-                '本股': '✅' if s['code'] == ticker else '',
-            } for s in stocks])
             st.dataframe(sdf, width='stretch', hide_index=True)
 
 # ---------- Tab6 研报 ----------
