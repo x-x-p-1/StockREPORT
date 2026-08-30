@@ -129,6 +129,27 @@ def cached_board_financials(board_code, ticker):
     return pd.DataFrame(rows) if rows else None
 
 
+# ========== 估值判断(Tab8) 缓存 ==========
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_main_business(ths):
+    return qr.get_main_business(ths)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_board_valuation(board_code):
+    return qr.board_valuation_stats(board_code)
+
+
+@st.cache_data(ttl=3600, show_spinner='正在计算主营相似度(逐家取主营构成, 首次稍慢)...')
+def cached_similarity(ths, peers_tuple):
+    return qr.main_business_similarity(ths, [{'code': c, 'name': n} for c, n in peers_tuple])
+
+
+@st.cache_data(ttl=3600, show_spinner='正在取历史估值(腾讯K线×EPS近似)...')
+def cached_val_history(ths):
+    return qr.get_valuation_history(ths, years=5)
+
+
 REPORTS_DIR = Path(qr.cfg_get('reports_dir') or
                      (Path(__file__).resolve().parent / 'reports' / '研报'))
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -377,11 +398,11 @@ if err or not ths:
 st.title(f'{name}  ({ths})')
 st.caption(f'更新于 {qr.datetime.now():%Y-%m-%d %H:%M}')
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     '📋 总览 Overview', '📈 利润表 Income Statement',
     '📊 资产负债表 Balance Sheet', '💵 现金流量表 Cash Flow',
     '🧩 概念板块 Concept Boards', '📰 券商研报 Research',
-    '🧬 因子画像 Factor Profile',
+    '🧬 因子画像 Factor Profile', '🧮 估值判断 Valuation',
 ])
 
 # ---------- Tab1 总览 Overview ----------
@@ -661,3 +682,119 @@ with tab7:
                     f" · PB 中位 {p.get('pb_med')} vs 本股 {p.get('pb_stock')}"
                     f"（{qr.fmt_pct(p.get('pb_vs')) if p.get('pb_vs') is not None else '-'}）")
     st.caption('数据源：同花顺三表/估值 + 东财概念成分股 · 仅供研究参考，非投资建议')
+
+
+# ---------- Tab8 估值判断 Valuation ----------
+with tab8:
+    st.subheader('🧮 估值判断 Valuation（横向 · 主营相似度 · 自身历史）')
+    st.caption('三维度判断当前估值位置：① 跟行业/概念比 ② 找业务结构最像的同行 ③ 跟自己历史比。'
+               '**估值是筛选参考，不是定价**——可比性请以主营构成为准。')
+    boards = cached_concept_boards(ticker)
+    if not boards:
+        st.info('未获取到概念板块')
+    else:
+        vordered = sorted(boards, key=lambda b: 0 if b.get('precise') == '1' else 1)
+        vopts = [f"{b['code']} {b['name']}（{qr.board_type(b)}）" for b in vordered]
+        base = st.selectbox('🏷️ 估值基准板块（行业 / 概念）', vopts, key='val_base')
+        bc = base.split(' ', 1)[0]
+
+        # ---- ① 横向: 本股 vs 板块估值分布 ----
+        stats = cached_board_valuation(bc)
+        val = cached_valuations(ths)
+        if stats and val:
+            pe_s, pb_s = stats.get('pe'), stats.get('pb')
+            cur_pe, cur_pb = val.get('pe_ttm'), val.get('pb_mrq')
+            bname = base.split(' ', 1)[1].split('（')[0]
+            st.markdown(f'**① 横向：本股 vs 板块「{bname}」**')
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric('本股 PE', f"{cur_pe:.1f}" if cur_pe else '-')
+            c2.metric('板块 PE 中位', f"{pe_s['median']}" if pe_s else '-')
+            c3.metric('板块 PE P25', f"{pe_s['p25']}" if pe_s else '-')
+            c4.metric('板块 PE P75', f"{pe_s['p75']}" if pe_s else '-')
+            if pe_s and cur_pe:
+                pos = '📈 高于 P75（板块内偏贵）' if cur_pe > pe_s['p75'] else (
+                    '📉 低于 P25（板块内偏便宜）' if cur_pe < pe_s['p25'] else '➖ 板块中位区间')
+            else:
+                pos = '-'
+            c5.metric('PE 位置', pos)
+            c1.metric('本股 PB', f"{cur_pb:.2f}" if cur_pb else '-')
+            c2.metric('板块 PB 中位', f"{pb_s['median']}" if pb_s else '-')
+            c3.metric('板块 PB P25', f"{pb_s['p25']}" if pb_s else '-')
+            c4.metric('板块 PB P75', f"{pb_s['p75']}" if pb_s else '-')
+            if pb_s and cur_pb:
+                pos = '📈 高于 P75（板块内偏贵）' if cur_pb > pb_s['p75'] else (
+                    '📉 低于 P25（板块内偏便宜）' if cur_pb < pb_s['p25'] else '➖ 板块中位区间')
+            else:
+                pos = '-'
+            c5.metric('PB 位置', pos)
+            st.caption(f"板块成分股 {stats['pe']['n'] if pe_s else 0} 家（东财）；"
+                       '用中位数避免微利/亏损股拉高均值')
+        st.divider()
+
+        # ---- ② 主营相似度: 找可比组 ----
+        st.markdown('**② 主营相似度：业务结构最像的同行（可比组候选）**')
+        st.caption('相似度 = 主营收入占比结构余弦（剔除"其他/合计"汇总项）；只做排序参考，'
+                   '**最终可比性请以每家主营构成为准**（点开看差异）')
+        vpeers = cached_board_stocks(bc)
+        if vpeers:
+            top_peers = tuple((s['code'], s['name']) for s in vpeers[:15])
+            sims = cached_similarity(ths, top_peers)
+            others = [x for x in sims if str(x['code']) != ticker][:5]
+            if others:
+                for r in others:
+                    with st.expander(f"🔗 {r['name']} · 主营相似度 {r['sim']:.2f}"):
+                        if r['structure']:
+                            for x in r['structure'][:6]:
+                                extra = (f"，毛利率 {(x['gross_margin'] or 0) * 100:.1f}%"
+                                         if x.get('gross_margin') else '')
+                                st.markdown(f"- {x['name']}：占比 {(x['ratio'] or 0) * 100:.1f}%{extra}")
+                        else:
+                            st.caption('（未取到主营构成）')
+            else:
+                st.caption('（板块内无其他成分股可对比）')
+        st.divider()
+
+        # ---- ③ 自身历史分位 ----
+        st.markdown('**③ 自身历史：近5年 PE/PB 分位（当前处于什么位置）**')
+
+        def _hpos(cur, qs):
+            if cur is None or not qs:
+                return '-'
+            if cur <= qs[10]:
+                return '🔻 历史低位（≤P10）'
+            if cur >= qs[90]:
+                return '🔺 历史高位（≥P90）'
+            if cur >= qs[75]:
+                return '📈 中高位'
+            if cur <= qs[25]:
+                return '📉 中低位'
+            return '➖ 中位'
+
+        h = cached_val_history(ths)
+        if h:
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric('当前 PE', f"{h['current_pe']}" if h['current_pe'] else '-')
+            c2.metric('P10', f"{h['pe'][10]}")
+            c3.metric('P25', f"{h['pe'][25]}")
+            c4.metric('P50', f"{h['pe'][50]}")
+            c5.metric('P75', f"{h['pe'][75]}")
+            c6.metric('P90', f"{h['pe'][90]}")
+            if h['current_pe'] and h['pe'][90] > h['pe'][10]:
+                pv = min(max((h['current_pe'] - h['pe'][10]) / (h['pe'][90] - h['pe'][10]), 0), 1)
+                st.progress(pv, text=f"PE 位置：{_hpos(h['current_pe'], h['pe'])}（{pv * 100:.0f}% 档）")
+            c1.metric('当前 PB', f"{h['current_pb']}" if h.get('current_pb') else '-')
+            if h.get('pb'):
+                c2.metric('P10', f"{h['pb'][10]}")
+                c3.metric('P25', f"{h['pb'][25]}")
+                c4.metric('P50', f"{h['pb'][50]}")
+                c5.metric('P75', f"{h['pb'][75]}")
+                c6.metric('P90', f"{h['pb'][90]}")
+                if h['current_pb'] and h['pb'][90] > h['pb'][10]:
+                    pv = min(max((h['current_pb'] - h['pb'][10]) / (h['pb'][90] - h['pb'][10]), 0), 1)
+                    st.progress(pv, text=f"PB 位置：{_hpos(h['current_pb'], h['pb'])}（{pv * 100:.0f}% 档）")
+            st.caption(f"近 {h['years']} 年 · {h['n']} 个周K样本（腾讯不复权价）")
+            st.caption('⚠️ 局限：PE 分位用**当前 EPS** 近似历史——盈利大幅增长的周期股会被系统性低估'
+                       '（如紫金矿业），参考性低；**PB 用当前净资产近似，变化慢、较可靠**。')
+        else:
+            st.info('未取到历史估值数据（可能标的无历史K线）')
+        st.caption('数据源：东财板块成分股估值/主营构成 + 腾讯历史K线 + 同花顺估值 · 仅供研究参考，非投资建议')

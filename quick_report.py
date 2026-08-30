@@ -1260,6 +1260,170 @@ def show_overview(ths, ticker, name):
     print(f'{"=" * 70}\n')
 
 
+# ========== 9. 估值判断(主营相似度 / 行业·概念基准 / 历史分位) ==========
+def get_main_business(thscode):
+    """东财 F10 主营构成 → [{name, income, ratio, gross_margin}]
+    取最新报告期 + 按产品(MAINOP_TYPE=2) + RANK 排序。
+    ratio=收入占比(小数, 0.808=80.8%); gross_margin=毛利率(小数)。"""
+    f10 = _f10_code(thscode.split('.')[0])
+    url = ('https://emweb.securities.eastmoney.com/PC_HSF10/BusinessAnalysis/'
+           f'PageAjax?code={f10}')
+    try:
+        r = requests.get(url, headers={'User-Agent': EM_UA,
+                                       'Referer': 'https://emweb.securities.eastmoney.com/'},
+                         timeout=20)
+        zy = (r.json() or {}).get('zygcfx') or []
+        if not zy:
+            return []
+        dates = sorted({z.get('REPORT_DATE') for z in zy}, reverse=True)
+        latest = [z for z in zy if z.get('REPORT_DATE') == dates[0]]
+        prod = sorted([z for z in latest if z.get('MAINOP_TYPE') == '2'],
+                      key=lambda z: z.get('RANK') or 99)
+        out = []
+        for z in prod:
+            nm = (z.get('ITEM_NAME') or '').strip()
+            if not nm:
+                continue
+            out.append({'name': nm,
+                        'income': z.get('MAIN_BUSINESS_INCOME'),
+                        'ratio': _to_float(z.get('MBI_RATIO')),
+                        'gross_margin': _to_float(z.get('GROSS_RPOFIT_RATIO'))})
+        return out
+    except Exception as e:
+        print(f'  [主营构成获取失败 {thscode}] {e}')
+        return []
+
+
+_BUSINESS_NOISE = ('合计', '总计', '主营收入', '整体')
+
+
+def _business_vector(structure, top=8):
+    """主营构成 → 占比向量(只滤汇总词, 保留'其他/贸易'大项以保留结构形状, 取前 top 项)。
+    用占比而非绝对收入 → 消除规模差异, 专注业务结构。"""
+    ratios = []
+    for s in structure:
+        nm = s.get('name') or ''
+        r = s.get('ratio')
+        if any(k in nm for k in _BUSINESS_NOISE):
+            continue
+        if isinstance(r, (int, float)) and r > 0:
+            ratios.append(abs(r))
+    if not ratios:
+        return None
+    return ratios[:top]
+
+
+def _cosine(a, b):
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if not n:
+        return 0.0
+    dot = sum(a[i] * b[i] for i in range(n))
+    na = (sum(x * x for x in a)) ** 0.5
+    nb = (sum(y * y for y in b)) ** 0.5
+    return dot / (na * nb) if (na and nb) else 0.0
+
+
+def main_business_similarity(thscode, peers):
+    """主营相似度: 本股 vs peers(成分股) → 按业务结构相似度降序
+    peers: [{code, name}] (取东财成分股代码, 会自动补 thscode)
+    返回 [{code, name, sim(0~1), structure(主营构成)}]"""
+    base = _business_vector(get_main_business(thscode))
+    if not base:
+        return []
+    out = []
+    for p in peers:
+        ths = _guess_thscode(str(p['code']))
+        st = get_main_business(ths) if ths else []
+        v = _business_vector(st)
+        out.append({'code': p['code'], 'name': p['name'],
+                    'sim': round(_cosine(base, v), 3), 'structure': st})
+    out.sort(key=lambda x: -x['sim'])
+    return out
+
+
+def board_valuation_stats(board_code, limit=200):
+    """板块成分股估值分布 → {pe:{median,mean,p25,p75,n}, pb:{...}}
+    用中位数避免微利/亏损股把均值拉飞。"""
+    st = get_board_stocks(board_code, limit=limit)
+    pes = [s['pe'] for s in st if s.get('pe') and s['pe'] > 0]
+    pbs = [s['pb'] for s in st if s.get('pb') and s['pb'] > 0]
+
+    def _stats(arr):
+        if not arr:
+            return None
+        s = sorted(arr)
+        def pct(p):
+            k = (len(s) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(s) - 1)
+            return s[f] + (s[c] - s[f]) * (k - f)
+        return {'median': round(pct(.5), 1), 'mean': round(sum(s) / len(s), 1),
+                'p25': round(pct(.25), 1), 'p75': round(pct(.75), 1), 'n': len(s)}
+    return {'pe': _stats(pes), 'pb': _stats(pbs)}
+
+
+def get_valuation_history(thscode, years=5):
+    """腾讯 不复权 历史K线 × 当前 EPS/BVPS 近似 → 历史 PE/PB 分位
+    返回 {years, n, current_pe, current_pb, pe:{p10..p90}, pb:{...}}
+    局限: 用『当前』EPS_ttm/BVPS 反推历史 PE/PB(拿不到历史每股指标):
+      - 盈利稳定的公司(消费/公用)较准; 盈利大幅增长/周期股会被低估(参考性低)
+      - PB 用当前净资产近似, 净资产变化慢, 分位相对可靠
+    → 定位为『相对位置参考』, 非精确估值; 平台上会标注此局限。"""
+    val = get_valuations(thscode)
+    if not val:
+        return None
+    snap = get_snapshot(thscode) or {}
+    price = snap.get('last_price') or 0
+    pe_ttm = val.get('pe_ttm')
+    pb = val.get('pb_mrq')
+    if not price:
+        return None
+    eps_ttm = (price / pe_ttm) if pe_ttm else None
+    bvps = (price / pb) if pb else None
+    if not eps_ttm:
+        return None
+    sym = ('sh' if thscode.endswith('.SH') else
+           'sz' if thscode.endswith('.SZ') else 'bj') + thscode.split('.')[0]
+    end = datetime.now().strftime('%Y-%m-%d')
+    start = (datetime.now() - timedelta(days=int(years * 365.25))).strftime('%Y-%m-%d')
+    url = (f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?'
+           f'param={sym},week,{start},{end},400,nfq')
+    try:
+        r = requests.get(url, headers={'User-Agent': EM_UA}, timeout=20)
+        d = (r.json().get('data') or {}).get(sym) or {}
+        arr = d.get('week') or d.get('qfqweek') or d.get('qfqday') or d.get('day') or []
+        closes = []
+        for row in arr:
+            try:
+                v = float(row[2])
+                if v > 0:
+                    closes.append(v)
+            except (TypeError, ValueError, IndexError):
+                pass
+        if len(closes) < 20:
+            return None
+        pes = [c / eps_ttm for c in closes]
+        pbs = [c / bvps for c in closes] if bvps else []
+
+        def pct(arr, p):
+            s = sorted(arr)
+            k = (len(s) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(s) - 1)
+            return s[f] + (s[c] - s[f]) * (k - f)
+        return {'years': years, 'n': len(closes),
+                'current_pe': round(pe_ttm, 1) if pe_ttm else None,
+                'current_pb': round(pb, 2) if pb else None,
+                'pe': {q: round(pct(pes, q / 100), 1) for q in (10, 25, 50, 75, 90)},
+                'pb': ({q: round(pct(pbs, q / 100), 2) for q in (10, 25, 50, 75, 90)}
+                       if pbs else None)}
+    except Exception as e:
+        print(f'  [历史估值获取失败 {thscode}] {e}')
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='快速看财报: 总览 + 三表明细(同比/环比)',
