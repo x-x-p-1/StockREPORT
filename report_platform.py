@@ -800,6 +800,36 @@ with tab8:
                     pv = min(max((h['current_pb'] - h['pb'][10]) / (h['pb'][90] - h['pb'][10]), 0), 1)
                     st.progress(pv, text=f"PB 位置：{_hpos(h['current_pb'], h['pb'])}（{pv * 100:.0f}% 档）")
             st.caption(f"近 {h['years']} 年 · {h['n']} 个周K样本（腾讯不复权价）")
+
+            # ---- 近5年 PE/PB 走势折线图(双Y轴) ----
+            if h.get('dates') and h.get('pe_series'):
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=h['dates'], y=h['pe_series'], name='PE',
+                                         line=dict(color='#3a86ff', width=1.6),
+                                         hovertemplate='%{x}<br>PE %{y:.1f}<extra></extra>'))
+                if h.get('pb_series'):
+                    fig.add_trace(go.Scatter(x=h['dates'], y=h['pb_series'], name='PB',
+                                             line=dict(color='#e63946', width=1.6),
+                                             yaxis='y2',
+                                             hovertemplate='%{x}<br>PB %{y:.2f}<extra></extra>'))
+                if h.get('current_pe'):
+                    fig.add_hline(y=h['current_pe'], line_dash='dot', line_color='#3a86ff',
+                                  annotation_text=f"当前PE {h['current_pe']}",
+                                  annotation_position='top left')
+                if h.get('current_pb') and h.get('pb_series'):
+                    fig.add_hline(y=h['current_pb'], line_dash='dot', line_color='#e63946',
+                                  annotation_text=f"当前PB {h['current_pb']}",
+                                  annotation_position='bottom right')
+                fig.update_layout(
+                    height=300, margin=dict(l=10, r=10, t=34, b=10),
+                    title=dict(text='近5年 PE / PB 走势', font=dict(size=13)),
+                    yaxis=dict(title='PE', showgrid=True, zeroline=False),
+                    yaxis2=dict(title='PB', overlaying='y', side='right',
+                                showgrid=False, zeroline=False),
+                    legend=dict(orientation='h', y=1.12, x=0),
+                    hovermode='x unified')
+                st.plotly_chart(fig, width='stretch')
+
             st.caption('⚠️ 局限：PE 分位用**当前 EPS** 近似历史——盈利大幅增长的周期股会被系统性低估'
                        '（如紫金矿业），参考性低；**PB 用当前净资产近似，变化慢、较可靠**。')
         else:

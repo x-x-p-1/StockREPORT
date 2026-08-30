@@ -1365,8 +1365,9 @@ def board_valuation_stats(board_code, limit=200):
 
 
 def get_valuation_history(thscode, years=5):
-    """腾讯 不复权 历史K线 × 当前 EPS/BVPS 近似 → 历史 PE/PB 分位
-    返回 {years, n, current_pe, current_pb, pe:{p10..p90}, pb:{...}}
+    """腾讯 不复权 历史K线 × 当前 EPS/BVPS 近似 → 历史 PE/PB 分位 + 时间序列
+    返回 {years, n, current_pe, current_pb, pe:{p10..p90}, pb:{...},
+          dates:[周K日期], pe_series:[历史PE], pb_series:[历史PB]}
     局限: 用『当前』EPS_ttm/BVPS 反推历史 PE/PB(拿不到历史每股指标):
       - 盈利稳定的公司(消费/公用)较准; 盈利大幅增长/周期股会被低估(参考性低)
       - PB 用当前净资产近似, 净资产变化慢, 分位相对可靠
@@ -1394,16 +1395,19 @@ def get_valuation_history(thscode, years=5):
         r = requests.get(url, headers={'User-Agent': EM_UA}, timeout=20)
         d = (r.json().get('data') or {}).get(sym) or {}
         arr = d.get('week') or d.get('qfqweek') or d.get('qfqday') or d.get('day') or []
-        closes = []
+        series = []          # [(date, close), ...]
         for row in arr:
             try:
-                v = float(row[2])
-                if v > 0:
-                    closes.append(v)
+                if len(row) >= 3:
+                    v = float(row[2])
+                    if v > 0:
+                        series.append((row[0], v))
             except (TypeError, ValueError, IndexError):
                 pass
-        if len(closes) < 20:
+        if len(series) < 20:
             return None
+        dates = [s[0] for s in series]
+        closes = [s[1] for s in series]
         pes = [c / eps_ttm for c in closes]
         pbs = [c / bvps for c in closes] if bvps else []
 
@@ -1418,7 +1422,10 @@ def get_valuation_history(thscode, years=5):
                 'current_pb': round(pb, 2) if pb else None,
                 'pe': {q: round(pct(pes, q / 100), 1) for q in (10, 25, 50, 75, 90)},
                 'pb': ({q: round(pct(pbs, q / 100), 2) for q in (10, 25, 50, 75, 90)}
-                       if pbs else None)}
+                       if pbs else None),
+                'dates': dates,
+                'pe_series': [round(x, 2) for x in pes],
+                'pb_series': [round(x, 2) for x in pbs] if pbs else []}
     except Exception as e:
         print(f'  [历史估值获取失败 {thscode}] {e}')
         return None
