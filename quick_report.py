@@ -357,15 +357,60 @@ def get_report_detail(info_code):
         return '', ''
 
 
+_CHALLENGE_SHIM = """
+var __c = [];
+var document = {};
+Object.defineProperty(document, 'cookie', {
+  get: function(){ return __c.join('; '); },
+  set: function(v){ __c.push(v); }
+});
+var location = { reload: function(){} };
+var window = { location: location };
+var navigator = { userAgent: 'Mozilla/5.0' };
+var setTimeout = function(fn, ms){};
+"""
+
+
 def download_report_pdf(pdf_url, save_path):
-    """下载研报PDF(带 %PDF 校验), 返回是否成功"""
+    """下载研报PDF(带 %PDF 校验), 返回是否成功
+    东财 pdf.dfcfw.com 有反爬: 首次请求返回混淆 JS 挑战页(算 EO_Bot_Ssid cookie)。
+    用 py_mini_racer(V8) 执行该 JS 取回 cookie, 带 cookie 重试拿到真 PDF。
+    """
+    s = requests.Session()
+    s.headers.update({'User-Agent': EM_UA, 'Accept-Language': 'zh-CN,zh;q=0.9',
+                      'Referer': 'https://data.eastmoney.com/'})
+
+    def _is_pdf(resp):
+        return resp.status_code == 200 and resp.content[:4] == b'%PDF'
+
+    def _save(resp):
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(resp.content)
+        return True
+
     try:
-        r = requests.get(pdf_url, headers={'User-Agent': EM_UA}, timeout=30)
-        if r.status_code == 200 and r.content[:4] == b'%PDF':
-            save_path = Path(save_path)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            save_path.write_bytes(r.content)
-            return True
+        r = s.get(pdf_url, timeout=40)
+        if _is_pdf(r):
+            return _save(r)
+        # 反爬挑战: 提取 JS 用 V8 执行, 算 cookie 后重试
+        m = re.search(r'<script>(.*?)</script>', r.text, re.S)
+        cookies = ''
+        if m and ('EO_Bot_Ssid' in r.text or 'document' in r.text):
+            try:
+                from py_mini_racer import MiniRacer
+                ctx = MiniRacer()
+                ctx.eval(_CHALLENGE_SHIM)
+                ctx.eval(m.group(1))
+                cookies = ctx.eval('document.cookie')
+            except Exception:
+                cookies = ''
+        if cookies:
+            r2 = s.get(pdf_url, headers={'Cookie': cookies,
+                                         'Referer': 'https://data.eastmoney.com/'},
+                       timeout=40)
+            if _is_pdf(r2):
+                return _save(r2)
     except Exception:
         pass
     return False
