@@ -530,7 +530,7 @@ with tab5:
                               default=gopts[:5], key='concept_pick')
         if pick:
             sel = tuple(b for b in ordered if f"{b['code']} {b['name']}" in pick)
-            html = cached_concept_graph(f'{name} ({ticker})', sel, 15)
+            html = cached_concept_graph(f'{name} ({ticker})', sel, 5)
             st.components.v1.html(html, height=680, scrolling=True)
         else:
             st.caption('（未选择概念，图式不显示）')

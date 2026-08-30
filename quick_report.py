@@ -663,11 +663,12 @@ _DYNAMIC_JS_TEMPLATE = r"""
 """
 
 
-def build_concept_graph_html(stock_label, boards, max_stocks=15, max_label=15):
+def build_concept_graph_html(stock_label, boards, max_stocks=5, max_label=15):
     """概念网络图(connected-papers 风格) → pyvis HTML
 
     力导向布局(forceAtlas2) + 按概念聚类配色 + 悬停高亮邻居 + 平滑曲线。
-    boards: [{code,name,...}]；每板块取市值前 max_stocks 只；全图市值前 max_label 只显示标签。
+    boards: [{code,name,...}]；每板块取市值前 max_stocks 只(默认5, 太多会拥挤)；
+    全图市值前 max_label 只显示标签。
     点击概念节点 → iframe 内弹出该概念成分股面板(数据内嵌, 自包含)。
     """
     import json as _json
