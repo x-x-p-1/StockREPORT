@@ -151,8 +151,23 @@ def cached_val_history(ths):
 
 
 @st.cache_data(ttl=3600, show_spinner='正在做财报体检(东财F10三表)...')
-def cached_checkup(ticker):
+def cached_checkup(ticker, _v=1):
     return qr.build_financial_checkup(ticker)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_dividend(ticker):
+    return qr.get_dividend_history(ticker)
+
+
+@st.cache_data(ttl=1800, show_spinner='正在匹配概念/行业板块...')
+def cached_search_boards(kw):
+    return qr.search_boards(kw)
+
+
+@st.cache_data(ttl=1800, show_spinner='正在并发取板块成分股研报(近90天)...')
+def cached_hotness(bc, top_n, days):
+    return qr.industry_report_hotness(bc, top_n=top_n, days=days)
 
 
 REPORTS_DIR = Path(qr.cfg_get('reports_dir') or
@@ -403,16 +418,17 @@ if err or not ths:
 st.title(f'{name}  ({ths})')
 st.caption(f'更新于 {qr.datetime.now():%Y-%m-%d %H:%M}')
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    '📋 总览 Overview', '📈 利润表 Income Statement',
-    '📊 资产负债表 Balance Sheet', '💵 现金流量表 Cash Flow',
-    '🧩 概念板块 Concept Boards', '📰 券商研报 Research',
-    '🧬 因子画像 Factor Profile', '🧮 估值判断 Valuation',
-    '🩺 财报体检 Checkup',
-])
+_TAB_NAMES = ['📋 总览 Overview', '📈 利润表 Income Statement',
+              '📊 资产负债表 Balance Sheet', '💵 现金流量表 Cash Flow',
+              '🧩 概念板块 Concept Boards', '📰 券商研报 Research',
+              '🧬 因子画像 Factor Profile', '🧮 估值判断 Valuation',
+              '🩺 财报体检 Checkup']
+cur_tab = st.segmented_control('', _TAB_NAMES, default=_TAB_NAMES[0],
+                               label_visibility='collapsed')
+st.caption('⚡ 懒加载：只取当前页签数据，切换秒开；其余页签点击后才取数')
 
 # ---------- Tab1 总览 Overview ----------
-with tab1:
+if cur_tab == '📋 总览 Overview':
     snap = cached_snapshot(ths)
     if snap:
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -433,6 +449,23 @@ with tab1:
         c3.metric('PB (MRQ)', qr.fmt_num(val.get('pb_mrq')))
         c4.metric('PS (TTM)', qr.fmt_num(val.get('ps_ttm')))
         c5.metric('PCF (TTM)', qr.fmt_num(val.get('pcf_ttm')))
+
+    dv = cached_dividend(ticker)
+    if dv and dv.get('records'):
+        dy = qr.dividend_yield_pct(dv, (snap or {}).get('last_price'))
+        st.subheader('分红股息 Dividend')
+        c1, c2, c3 = st.columns(3)
+        c1.metric('股息率(近12月) Div Yield', f'{dy:.2f}%' if dy is not None else '-',
+                  help='近12个月每股派息 ÷ 现价，高股息一般指 > 3-4%')
+        c2.metric('近12月每股派息', f"{(dv.get('last12m_per10') or 0) / 10:.3f} 元")
+        c3.metric('近5年累计每10股派息', f"{dv.get('per10_5y', 0):.2f} 元")
+        with st.expander('📜 近5年分红送配记录 Dividend History（含税/每10股）'):
+            rows = [[r['date'], r['per10'], r['progress'], r['plan']]
+                    for r in dv['records']]
+            st.dataframe(pd.DataFrame(rows, columns=['除权除息日', '每10股派息(元)', '进度', '方案']),
+                         width='stretch', hide_index=True)
+            st.caption('股息率 = 近12个月每股派息 ÷ 现价（含税口径）。高股息常见于银行/公用事业/煤炭/运营商；'
+                       '周期股高股息可能处于景气顶点，需结合周期判断。数据源：东财分红送配公告')
 
     st.subheader('收入与利润 Revenue & Profit（同口径）')
     r1, r2 = st.columns(2)
@@ -478,9 +511,9 @@ with tab1:
         st.warning(aerr)
 
 # ---------- Tab2-4 三表明细（同口径） ----------
-STATEMENT_TAB = {'income': (tab2, '📈 利润表 Income Statement'),
-                 'balance': (tab3, '📊 资产负债表 Balance Sheet'),
-                 'cashflow': (tab4, '💵 现金流量表 Cash Flow')}
+STATEMENT_TAB = {'income': '📈 利润表 Income Statement',
+                 'balance': '📊 资产负债表 Balance Sheet',
+                 'cashflow': '💵 现金流量表 Cash Flow'}
 CHART_COLS = {
     'income': [('operating_income', '营业收入 Revenue'), ('parent_holder_net_profit', '归母净利润 Net Profit')],
     'balance': [('assets_total', '资产 Total Assets'), ('total_debt', '负债 Total Liabilities'),
@@ -489,8 +522,8 @@ CHART_COLS = {
                  ('financing_cash_flow_net', '筹资 Financing')],
 }
 
-for st_key, (tab, title) in STATEMENT_TAB.items():
-    with tab:
+for st_key, title in STATEMENT_TAB.items():
+    if cur_tab == title:
         is_flow = qr.STATEMENTS[st_key]['kind'] == 'flow'
         opts = ['single', 'h1', 'fy'] if is_flow else ['all', 'h1', 'fy']
         scope = st.radio('报告口径 Scale（只显示同尺度数据）', opts, index=0, horizontal=True,
@@ -541,7 +574,7 @@ for st_key, (tab, title) in STATEMENT_TAB.items():
                     render_line_chart(cdf2, ['值'], f'{label} 趋势 Line Trend', unit)
 
 # ---------- Tab5 概念板块 ----------
-with tab5:
+if cur_tab == '🧩 概念板块 Concept Boards':
     st.subheader('所属概念板块 Concept Boards（东财）')
     boards = cached_concept_boards(ticker)
     if not boards:
@@ -589,7 +622,7 @@ with tab5:
             st.caption('市值/PE/PB 来自东财；毛利率/营收增速/净利增速/ROE 取市值前12(同花顺，逐个调接口首次稍慢)')
 
 # ---------- Tab6 研报 ----------
-with tab6:
+if cur_tab == '📰 券商研报 Research':
     st.subheader('最近券商研报 Research Reports（东财）')
     reports = cached_reports(ticker)
     if not reports:
@@ -629,8 +662,51 @@ with tab6:
         else:
             st.caption('（无 PDF 链接）')
 
+        # ========== 反向检索：产业/主题研报 → 公司 ==========
+        st.divider()
+        st.subheader('🔁 反向检索：产业/主题研报 → 公司')
+        st.caption('不选公司读研报，而是：**输入行业/主题 → 匹配概念板块 → 对该板块成分股逐个取研报**，'
+                   '聚合出「最近被券商反复覆盖、给出评级」的公司，让你从产业视角发现标的。')
+        rq = st.text_input('产业/主题关键词（如 白酒、半导体、储能、煤炭）', key='rev_keyword')
+        if st.button('🔍 检索', type='primary'):
+            st.session_state['rev_kw'] = (rq or '').strip()
+        rkw = st.session_state.get('rev_kw', '')
+        if rkw:
+            st.caption(f'当前检索：**{rkw}**（改关键词后请再次点「检索」）')
+            hits = cached_search_boards(rkw)
+            if not hits:
+                st.info(f'未找到名称含「{rkw}」的东财概念/行业板块。可尝试更短关键词（如「半导体」「煤炭」）。')
+            else:
+                ropts = [f"{b['code']} {b['name']}（{'概念' if b['kind'] == 'concept' else '行业'}）"
+                         for b in hits]
+                rb = st.selectbox('匹配到的板块（成分股范围）', ropts, key='rev_board')
+                rbc = re.sub(r'\D', '', rb.split(' ', 1)[0])   # BK0896 → 0896
+                hot = cached_hotness(rbc, 20, 90)
+                if not hot:
+                    st.info('未取到研报数据')
+                else:
+                    agg = {}
+                    for h in hot:
+                        for k, v in h['ratings'].items():
+                            agg[k] = agg.get(k, 0) + v
+                    st.markdown('**近90天板块研报评级汇总**：' +
+                                '  '.join(f'**{k}** {v} 篇' for k, v in
+                                         sorted(agg.items(), key=lambda x: -x[1])) or '（无评级）')
+                    rows = []
+                    for h in hot:
+                        rows.append({'公司': h['name'], '代码': h['code'],
+                                     '总市值': f"{h['mcap'] / 1e8:.0f}亿" if h.get('mcap') else '-',
+                                     '近90天研报': h['recent'],
+                                     '最新评级': h['latest_rating'],
+                                     '最近日期': h['latest_date'],
+                                     '评级分布': ' '.join(f'{k}{v}' for k, v in h['ratings'].items())})
+                    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+                    st.caption('「近90天研报」= 近90天被券商覆盖篇数（覆盖越多 = 产业研报越关注）；'
+                               '「评级分布」= 买入/增持/持有篇数。数据源：东财研报（板块市值前20成分股）。'
+                               '只摆研报覆盖与评级，结论请自行判断')
+
 # ---------- Tab7 因子画像（大师关注点 → A股因子 总结） ----------
-with tab7:
+if cur_tab == '🧬 因子画像 Factor Profile':
     st.subheader('因子画像 Factor Profile（大师关注点 → A股因子）')
     st.caption('把巴菲特/格雷厄姆/林奇/费雪关注的指标提炼为 A 股口径可计算因子；'
                '因子=连续画像（强弱），非买卖结论')
@@ -691,7 +767,7 @@ with tab7:
 
 
 # ---------- Tab8 估值判断 Valuation ----------
-with tab8:
+if cur_tab == '🧮 估值判断 Valuation':
     st.subheader('🧮 估值判断 Valuation（横向 · 主营相似度 · 自身历史）')
     st.caption('三维度判断当前估值位置：① 跟行业/概念比 ② 找业务结构最像的同行 ③ 跟自己历史比。'
                '**估值是筛选参考，不是定价**——可比性请以主营构成为准。')
@@ -844,15 +920,15 @@ with tab8:
 
 
 # ---------- Tab9 财报体检 Financial Checkup ----------
-with tab9:
+if cur_tab == '🩺 财报体检 Checkup':
     st.subheader('🩺 财报体检 Financial Checkup')
     st.caption('只做三件事：把财报硬数据算成指标、标出值得注意的数字、给判定线。'
                '**不下结论——结论请你结合研报与自己的判断下**。')
-    ck = cached_checkup(ticker)
+    ck = cached_checkup(ticker, _v=2)
     if not ck:
         st.info('未取到财报数据')
     else:
-        st.markdown('**① 12 项核心指标（财报硬数据直接算）**')
+        st.markdown('**① 核心指标（财报硬数据直接算，含股息率）**')
         for ind in ck['indicators']:
             with st.expander(f"{ind['name']}  →  {ind['value']}", expanded=False):
                 st.markdown(f"**判定线**：{ind['line']}")

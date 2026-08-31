@@ -43,6 +43,7 @@ import getpass
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -502,8 +503,9 @@ def board_type(b):
 
 def get_board_stocks(board_code, limit=200):
     """板块成分股(push2delay) → [{code,name,price,pct,mcap,pe,pb}], 按总市值降序
-    board_code: F10 板块代码(数字), 会补零成 4 位 BK 代码(如 714 → BK0714)"""
-    fs = f'b:BK{str(board_code).zfill(4)}'
+    board_code: F10 板块代码(数字如 714) 或 BK 代码(如 BK0896), 自动规整成 4 位"""
+    num = re.sub(r'\D', '', str(board_code))
+    fs = f'b:BK{num.zfill(4)}'
     params = {'pn': 1, 'pz': limit, 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2,
               'fid': 'f20', 'fs': fs, 'fields': 'f12,f14,f2,f3,f20,f9,f23'}
     try:
@@ -526,6 +528,147 @@ def get_board_stocks(board_code, limit=200):
     except Exception as e:
         print(f'  [成分股获取失败] {e}')
         return []
+
+
+# ========== 5.6 板块检索 + 股息率 + 产业研报热度(东财,免key) ==========
+_BOARD_CACHE = {'ts': 0, 'concept': [], 'industry': []}
+
+
+def _fetch_boards(kind):
+    """拉取东财板块全列表(kind=concept概念/industry行业), 分页到取完为止"""
+    fs = 'm:90+t:3' if kind == 'concept' else 'm:90+t:2'
+    out = []
+    for pn in range(1, 20):
+        params = {'pn': pn, 'pz': 100, 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2,
+                  'fid': 'f12', 'fs': fs, 'fields': 'f12,f14'}
+        try:
+            r = requests.get('https://push2delay.eastmoney.com/api/qt/clist/get',
+                             params=params,
+                             headers={'User-Agent': EM_UA,
+                                      'Referer': 'https://quote.eastmoney.com/'},
+                             timeout=15)
+            diff = ((r.json() or {}).get('data') or {}).get('diff') or []
+        except Exception:
+            break
+        if not diff:
+            break
+        out.extend([{'code': str(it.get('f12', '')), 'name': it.get('f14', ''),
+                     'kind': kind} for it in diff])
+        if len(diff) < 100:
+            break
+    return out
+
+
+def get_all_boards(kind='concept'):
+    """东财板块全列表(1小时进程内缓存) → [{code,name,kind}]"""
+    now = time.time()
+    if now - _BOARD_CACHE['ts'] > 3600 or not _BOARD_CACHE.get(kind):
+        _BOARD_CACHE[kind] = _fetch_boards(kind)
+        _BOARD_CACHE['ts'] = now
+    return _BOARD_CACHE[kind]
+
+
+def search_boards(keyword, max_hits=10):
+    """关键词 → 匹配的概念+行业板块 → [{code,name,kind}]（按名称子串匹配）"""
+    kw = (keyword or '').strip()
+    if not kw:
+        return []
+    hits = []
+    for b in (get_all_boards('concept') + get_all_boards('industry')):
+        if kw in (b['name'] or ''):
+            hits.append(b)
+            if len(hits) >= max_hits:
+                break
+    return hits
+
+
+def get_dividend_history(ticker, years=5):
+    """东财分红送配历史 → {records:[{date,per10,plan,report,progress}],
+    last12m_per10(近12个月每10股派息, 含税), per10_5y}
+    PRETAX_BONUS_RMB = 每10股派息(元, 含税); date = 除权除息日"""
+    ticker = str(ticker).strip().zfill(6)
+    params = {'reportName': 'RPT_SHAREBONUS_DET', 'columns': 'ALL',
+              'filter': f'(SECURITY_CODE="{ticker}")',
+              'pageNumber': 1, 'pageSize': 50,
+              'sortColumns': 'EX_DIVIDEND_DATE', 'sortTypes': '-1'}
+    try:
+        r = requests.get('https://datacenter-web.eastmoney.com/api/data/v1/get',
+                         params=params, headers={'User-Agent': EM_UA}, timeout=20)
+        data = ((r.json() or {}).get('result') or {}).get('data') or []
+    except Exception as e:
+        print(f'  [分红获取失败] {e}')
+        return None
+    records = []
+    now = datetime.now()
+    for it in data:
+        date_s = str(it.get('EX_DIVIDEND_DATE') or '')[:10]
+        if not date_s or date_s.startswith('0001'):
+            continue
+        per10 = it.get('PRETAX_BONUS_RMB')
+        records.append({'date': date_s,
+                        'per10': round(float(per10), 3) if per10 is not None else None,
+                        'plan': it.get('IMPL_PLAN_PROFILE') or '',
+                        'report': str(it.get('REPORT_DATE') or '')[:10],
+                        'progress': it.get('ASSIGN_PROGRESS') or ''})
+    last12m = sum(r['per10'] for r in records if r['per10']
+                  and 0 <= (now - _parse_d(r['date'])).days <= 365)
+    per10_5y = sum(r['per10'] for r in records if r['per10']
+                   and (now.year - years) <= int(r['date'][:4]))
+    return {'records': records, 'last12m_per10': round(last12m, 3),
+            'per10_5y': round(per10_5y, 3)}
+
+
+def _parse_d(s):
+    try:
+        return datetime.strptime(s, '%Y-%m-%d')
+    except Exception:
+        return datetime.min
+
+
+def dividend_yield_pct(dv, price):
+    """股息率% = 近12个月每股派息 / 现价 × 100（每股=每10股/10）"""
+    if not dv or not price:
+        return None
+    per_share = (dv.get('last12m_per10') or 0) / 10.0
+    if per_share <= 0 or price <= 0:
+        return None
+    return round(per_share / price * 100, 2)
+
+
+def industry_report_hotness(board_code, top_n=20, days=90):
+    """产业研报热度：板块成分股并发取各家研报 → 聚合热度表(按研报数降序)
+    返回 [{code,name,mcap,recent,latest_date,latest_rating,ratings}]
+    recent = 近days天研报数; ratings = {评级: 次数}"""
+    stocks = get_board_stocks(board_code, limit=200)[:top_n]
+    if not stocks:
+        return []
+    begin = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    def _one(s):
+        return s['code'], get_reports_eastmoney(s['code'], page_size=15, begin=begin)
+
+    try:
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            results = dict(ex.map(_one, stocks))
+    except Exception:
+        results = {s['code']: [] for s in stocks}
+    rows = []
+    for s in stocks:
+        reps = results.get(s['code']) or []
+        rating_cnt = {}
+        latest = None
+        for r in reps:
+            rt = r.get('emRatingName') or ''
+            if rt:
+                rating_cnt[rt] = rating_cnt.get(rt, 0) + 1
+        if reps:
+            latest = reps[0]
+        rows.append({'code': s['code'], 'name': s['name'],
+                     'mcap': s.get('mcap'), 'recent': len(reps),
+                     'latest_date': str((latest or {}).get('publishDate') or '')[:10],
+                     'latest_rating': (latest or {}).get('emRatingName') or '',
+                     'ratings': rating_cnt})
+    return sorted(rows, key=lambda x: -x['recent'])
 
 
 _CONCEPT_PALETTE = ['#e63946', '#2a9d8f', '#3a86ff', '#e9c46a', '#8e7cc3',
@@ -1512,6 +1655,10 @@ def build_financial_checkup(ticker):
     dnpm = f(i.get('DEDUCT_PARENT_NETPROFIT'))
     netcf = f(c.get('NETCASH_OPERATE'))
     fincf = f(c.get('NETCASH_FINANCE'))
+    dv = get_dividend_history(ticker)
+    _snap = get_snapshot(ths)
+    _price = (_snap or {}).get('last_price')
+    dy = dividend_yield_pct(dv, _price)
     cash = f(b.get('MONETARYFUNDS'))
     short = (f(b.get('SHORT_LOAN')) or 0) + (f(b.get('NONCURRENT_LIAB_1YEAR')) or 0)
     long_loan = f(b.get('LONG_LOAN')) or 0
@@ -1603,6 +1750,10 @@ def build_financial_checkup(ticker):
         add('估值历史分位(近5年)', f"PE {cur} · {pos}", '分位越低越便宜',
             '看现在价格在历史上算贵还是便宜',
             f"P10={pe_q[10]} P50={pe_q[50]} P90={pe_q[90]}（近{h['years']}年）")
+
+    add('股息率(近12月)', f'{dy:.2f}%' if dy is not None else '-', '> 3-4% 属高股息',
+        '真金白银的分红回报，现金流与股东回报的硬指标',
+        '高股息常见于银行/公用事业/煤炭/运营商；周期股高股息可能处于景气顶点，需结合周期判断')
 
     # ---- 异常信号(只摆数据, 给方向, 不替结论) ----
     if dnp is not None and dnp < 0.6:
