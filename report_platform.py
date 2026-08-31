@@ -69,13 +69,15 @@ def cached_valuations(ths):
     return qr.get_valuations(ths)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# 缓存策略: 慢且稳定的数据 → persist="disk"(磁盘持久化, 重启服务也保留) + 24h TTL;
+# 快变数据(行情/估值/研报列表) → 仅内存缓存, 短 TTL 保证新鲜。
+@st.cache_data(ttl=86400, persist='disk', show_spinner=False)
 def cached_statement(ths, st_key, limit):
     meta = qr.STATEMENTS[st_key]
     return qr.ths_get(meta['path'], {'thscode': ths, 'period': 'quarterly', 'limit': limit})
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, persist='disk', show_spinner=False)
 def cached_indicators(ths):
     return qr.get_indicators_latest(ths)
 
@@ -90,7 +92,7 @@ def cached_report_detail(info_code):
     return qr.get_report_detail(info_code)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, persist='disk', show_spinner=False)
 def cached_concept_boards(ticker):
     return qr.get_concept_boards(ticker)
 
@@ -105,7 +107,7 @@ def cached_concept_graph(stock_label, boards_tuple, max_stocks):
     return qr.build_concept_graph_html(stock_label, list(boards_tuple), max_stocks)
 
 
-@st.cache_data(ttl=3600, show_spinner='正在取成分股财务数据(市值前12, 同花顺)...')
+@st.cache_data(ttl=86400, persist='disk', show_spinner='正在取成分股财务数据(市值前12, 同花顺)...')
 def cached_board_financials(board_code, ticker):
     """板块成分股财务表: 市值/PE/PB(东财, 全量) + 毛利率/营收增速/净利增速/ROE(同花顺, 市值前12)"""
     stocks = qr.get_board_stocks(board_code, limit=200)
@@ -130,32 +132,32 @@ def cached_board_financials(board_code, ticker):
 
 
 # ========== 估值判断(Tab8) 缓存 ==========
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, persist='disk', show_spinner=False)
 def cached_main_business(ths):
     return qr.get_main_business(ths)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, persist='disk', show_spinner=False)
 def cached_board_valuation(board_code):
     return qr.board_valuation_stats(board_code)
 
 
-@st.cache_data(ttl=3600, show_spinner='正在计算主营相似度(逐家取主营构成, 首次稍慢)...')
+@st.cache_data(ttl=86400, persist='disk', show_spinner='正在计算主营相似度(逐家取主营构成, 首次稍慢)...')
 def cached_similarity(ths, peers_tuple):
     return qr.main_business_similarity(ths, [{'code': c, 'name': n} for c, n in peers_tuple])
 
 
-@st.cache_data(ttl=3600, show_spinner='正在取历史估值(腾讯K线×EPS近似)...')
+@st.cache_data(ttl=86400, persist='disk', show_spinner='正在取历史估值(腾讯K线×EPS近似)...')
 def cached_val_history(ths):
     return qr.get_valuation_history(ths, years=5)
 
 
-@st.cache_data(ttl=3600, show_spinner='正在做财报体检(东财F10三表)...')
-def cached_checkup(ticker, _v=1):
+@st.cache_data(ttl=86400, persist='disk', show_spinner='正在做财报体检(东财F10三表)...')
+def cached_checkup(ticker, _v=3):
     return qr.build_financial_checkup(ticker)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, persist='disk', show_spinner=False)
 def cached_dividend(ticker):
     return qr.get_dividend_history(ticker)
 
@@ -424,7 +426,9 @@ _TAB_NAMES = ['📋 总览 Overview', '📈 利润表 Income Statement',
               '🧬 因子画像 Factor Profile', '🧮 估值判断 Valuation',
               '🩺 财报体检 Checkup']
 cur_tab = st.segmented_control('', _TAB_NAMES, default=_TAB_NAMES[0],
-                               label_visibility='collapsed')
+                               label_visibility='collapsed', key='main_tab')
+if not cur_tab:
+    cur_tab = _TAB_NAMES[0]      # 兜底：key 状态丢失时回到总览
 st.caption('⚡ 懒加载：只取当前页签数据，切换秒开；其余页签点击后才取数')
 
 # ---------- Tab1 总览 Overview ----------

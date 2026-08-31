@@ -1469,19 +1469,28 @@ def _cosine(a, b):
 
 
 def main_business_similarity(thscode, peers):
-    """主营相似度: 本股 vs peers(成分股) → 按业务结构相似度降序
+    """主营相似度: 本股 vs peers(成分股) → 按业务结构相似度降序(并发取主营, 15家~3s)
     peers: [{code, name}] (取东财成分股代码, 会自动补 thscode)
     返回 [{code, name, sim(0~1), structure(主营构成)}]"""
     base = _business_vector(get_main_business(thscode))
     if not base:
         return []
-    out = []
-    for p in peers:
+
+    def _one(p):
         ths = _guess_thscode(str(p['code']))
         st = get_main_business(ths) if ths else []
-        v = _business_vector(st)
+        return p, st
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(_one, peers))
+    except Exception:
+        results = [(p, []) for p in peers]
+    out = []
+    for p, st in results:
         out.append({'code': p['code'], 'name': p['name'],
-                    'sim': round(_cosine(base, v), 3), 'structure': st})
+                    'sim': round(_cosine(base, _business_vector(st)), 3),
+                    'structure': st})
     out.sort(key=lambda x: -x['sim'])
     return out
 
