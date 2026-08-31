@@ -150,6 +150,11 @@ def cached_val_history(ths):
     return qr.get_valuation_history(ths, years=5)
 
 
+@st.cache_data(ttl=3600, show_spinner='正在做财报体检(东财F10三表)...')
+def cached_checkup(ticker):
+    return qr.build_financial_checkup(ticker)
+
+
 REPORTS_DIR = Path(qr.cfg_get('reports_dir') or
                      (Path(__file__).resolve().parent / 'reports' / '研报'))
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -398,11 +403,12 @@ if err or not ths:
 st.title(f'{name}  ({ths})')
 st.caption(f'更新于 {qr.datetime.now():%Y-%m-%d %H:%M}')
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     '📋 总览 Overview', '📈 利润表 Income Statement',
     '📊 资产负债表 Balance Sheet', '💵 现金流量表 Cash Flow',
     '🧩 概念板块 Concept Boards', '📰 券商研报 Research',
     '🧬 因子画像 Factor Profile', '🧮 估值判断 Valuation',
+    '🩺 财报体检 Checkup',
 ])
 
 # ---------- Tab1 总览 Overview ----------
@@ -835,3 +841,47 @@ with tab8:
         else:
             st.info('未取到历史估值数据（可能标的无历史K线）')
         st.caption('数据源：东财板块成分股估值/主营构成 + 腾讯历史K线 + 同花顺估值 · 仅供研究参考，非投资建议')
+
+
+# ---------- Tab9 财报体检 Financial Checkup ----------
+with tab9:
+    st.subheader('🩺 财报体检 Financial Checkup')
+    st.caption('只做三件事：把财报硬数据算成指标、标出值得注意的数字、给判定线。'
+               '**不下结论——结论请你结合研报与自己的判断下**。')
+    ck = cached_checkup(ticker)
+    if not ck:
+        st.info('未取到财报数据')
+    else:
+        st.markdown('**① 12 项核心指标（财报硬数据直接算）**')
+        for ind in ck['indicators']:
+            with st.expander(f"{ind['name']}  →  {ind['value']}", expanded=False):
+                st.markdown(f"**判定线**：{ind['line']}")
+                st.markdown(f"**为什么看**：{ind['why']}")
+                st.markdown(f"**怎么看**：{ind['how']}")
+        st.divider()
+
+        st.markdown('**② 异常信号（值得你注意的数字，需你核实判断）**')
+        if ck['signals']:
+            for s in ck['signals']:
+                st.markdown(f"🔍 **{s['title']}**")
+                st.markdown(f"**{s['data']}**")
+                st.caption(s['desc'])
+        else:
+            st.success('未发现明显异常信号')
+        st.divider()
+
+        st.markdown('**③ 防造假四检**')
+        for fr in ck['fraud']:
+            st.markdown(f"**{fr['name']}**：{fr['data']}  →  **{fr['verdict']}**")
+            st.caption(fr['desc'])
+        st.divider()
+
+        st.markdown('**④ 股东户数趋势（筹码分散度）**')
+        if ck['holder']:
+            rows = [[h['date'], f"{h['num'] / 10000:.1f}万户",
+                     (f"{h['ratio']:+.1f}%" if h.get('ratio') is not None else '-')]
+                    for h in ck['holder'][:6]]
+            st.dataframe(pd.DataFrame(rows, columns=['报告期', '股东户数', '环比']),
+                         width='stretch', hide_index=True)
+            st.caption('户数快速增加 = 筹码散户化（机构让位）；下降 = 筹码集中')
+        st.caption('数据源：东财F10完整三表 + 股东户数 + 同花顺估值 · 仅供研究参考，非投资建议 · 结论请自行判断')

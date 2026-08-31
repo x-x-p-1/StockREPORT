@@ -1431,6 +1431,246 @@ def get_valuation_history(thscode, years=5):
         return None
 
 
+# ========== 10. 财报体检(东财F10完整三表 → 12指标+异常信号+防造假四检) ==========
+def _recent_quarters(n=5):
+    """最近 n 个季末日(YYYY-MM-DD, 最新在前), 含尚未披露的未来季末(接口会忽略)"""
+    qs = []
+    y, m = datetime.now().year, datetime.now().month
+    for _ in range(n):
+        qm = ((m - 1) // 3) * 3 + 3          # 所在季度末月 3/6/9/12
+        day = 31 if qm in (3, 12) else 30
+        qs.append(f'{y}-{qm:02d}-{day:02d}')
+        m -= 3
+        if m <= 0:
+            m += 12
+            y -= 1
+    return qs
+
+
+def _em_fin(ep, ticker, dates=None):
+    """东财F10三表 → [{REPORT_DATE,...}] 按报告期降序
+    ep: Lrb(利润表)/Zcfzb(资产负债)/Xjllb(现金流); dates 逗号分隔报告期(默认最近5季末)"""
+    if not dates:
+        dates = ','.join(_recent_quarters(5))
+    code = _f10_code(ticker)
+    url = (f'https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/'
+           f'{ep}AjaxNew?companyType=4&reportDateType=0&reportType=1&dates={dates}&code={code}')
+    try:
+        r = requests.get(url, headers={'User-Agent': EM_UA,
+                                       'Referer': 'https://emweb.securities.eastmoney.com/'}, timeout=20)
+        data = (r.json() or {}).get('data') or []
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f'  [F10 {ep} 获取失败] {e}')
+        return []
+
+
+def get_holder_num(ticker):
+    """股东户数趋势 → [{date, num, ratio}], 最新在前"""
+    url = ('https://emweb.securities.eastmoney.com/PC_HSF10/ShareholderResearch/'
+           f'PageAjax?code={_f10_code(ticker)}')
+    try:
+        r = requests.get(url, headers={'User-Agent': EM_UA,
+                                       'Referer': 'https://emweb.securities.eastmoney.com/'}, timeout=20)
+        gd = (r.json() or {}).get('gdrs') or []
+        out = []
+        for g in gd:
+            n = g.get('HOLDER_TOTAL_NUM')
+            if n:
+                out.append({'date': (g.get('END_DATE') or '')[:10],
+                            'num': n, 'ratio': g.get('TOTAL_NUM_RATIO')})
+        return out
+    except Exception:
+        return []
+
+
+def build_financial_checkup(ticker):
+    """财报体检(硬数据, 只摆数据+判定线, 不下结论):
+    返回 {indicators:[{name,value,line,why,how}], signals:[{title,data,desc}],
+          fraud:[{name,data,verdict,desc}], holder:[{date,num,ratio}]}
+    数据源: 东财F10完整三表(含扣非/存货/短债/合同负债/商誉/少数权益) + 股东户数 + 估值分位"""
+    ths = _guess_thscode(str(ticker)) or (str(ticker) + '.SH')
+    inc = _em_fin('Lrb', ticker)
+    bal = _em_fin('Zcfzb', ticker)
+    csh = _em_fin('Xjllb', ticker)
+    if not (inc and bal and csh):
+        return None
+    i, b, c = inc[0], bal[0], csh[0]     # 最新期
+
+    def f(v, nd=2):
+        return round(float(v), nd) if v is not None else None
+
+    out = {'indicators': [], 'signals': [], 'fraud': [],
+           'holder': get_holder_num(ticker)}
+
+    assets = f(b.get('TOTAL_ASSETS'))
+    peq = f(b.get('TOTAL_PARENT_EQUITY'))
+    teq = f(b.get('TOTAL_EQUITY'))
+    rev = f(i.get('OPERATE_INCOME'))
+    cost = f(i.get('OPERATE_COST'))
+    npm = f(i.get('PARENT_NETPROFIT'))
+    dnpm = f(i.get('DEDUCT_PARENT_NETPROFIT'))
+    netcf = f(c.get('NETCASH_OPERATE'))
+    fincf = f(c.get('NETCASH_FINANCE'))
+    cash = f(b.get('MONETARYFUNDS'))
+    short = (f(b.get('SHORT_LOAN')) or 0) + (f(b.get('NONCURRENT_LIAB_1YEAR')) or 0)
+    long_loan = f(b.get('LONG_LOAN')) or 0
+    recv = f(b.get('ACCOUNTS_RECE'))
+    inv = f(b.get('INVENTORY'))
+    good = f(b.get('GOODWILL'))
+    ctr = f(b.get('CONTRACT_LIAB'))
+    fixa = f(b.get('FIXED_ASSET'))
+    fin_exp = f(i.get('FE_INTEREST_EXPENSE'))
+    # 上期对比
+    bi, ci = (bal[1] if len(bal) > 1 else {}), (csh[1] if len(csh) > 1 else {})
+    fixa_prev, recv_prev = f(bi.get('FIXED_ASSET')), f(bi.get('ACCOUNTS_RECE'))
+    netcf_prev = f(ci.get('NETCASH_OPERATE'))
+    npm_yoy, rev_yoy = i.get('PARENT_NETPROFIT_YOY'), i.get('OPERATE_INCOME_YOY')
+
+    def pct(x):
+        return f'{x * 100:.1f}%' if x is not None else '-'
+
+    def add(name, value, line, why, how):
+        out['indicators'].append({'name': name, 'value': value, 'line': line,
+                                  'why': why, 'how': how})
+
+    # ---- 12 指标 ----
+    lev = assets / peq if (assets and peq) else None
+    add('杠杆率(归母口径)', f'{lev:.2f} 倍' if lev else '-', '> 2.5 倍高危',
+        '判断公司是拿自己的钱还是借别人的钱经营',
+        '越高越依赖杠杆；银行/保险/重资产行业天然高杠杆，需结合行业判断')
+    lev_all = assets / teq if (assets and teq) else None
+    add('杠杆率(含少数股东)', f'{lev_all:.2f} 倍' if lev_all else '-', '> 2.5 倍高危',
+        '把少数股东权益也算进净资产，更接近实际杠杆',
+        '与归母口径差异大说明少数股东权益占比高(如京东方)')
+
+    cov = cash / short if (cash and short) else None
+    add('货币资金/短债覆盖', (f'{cov:.2f} 倍' if cov is not None else '无短债'),
+        '< 1 倍预警', '账上现金能否盖住一年内要还的债，是暴雷风险的试金石',
+        '覆盖越低越危险；<0.5 需高度重视')
+
+    roe = npm / peq * 2 if (npm and peq) else None     # 中报年化
+    add('ROE(年化)', f'{roe * 100:.1f}%' if roe else '-', '> 15% 优秀',
+        '股东每投一块钱一年赚回多少，巴菲特最看重',
+        '重资产/周期股 ROE 天然偏低，看长期中枢而非单期')
+
+    dnp = dnpm / npm if (dnpm and npm) else None
+    add('扣非净利占比', pct(dnp), '< 60% 提示水分',
+        '剔除卖资产/补贴/炒股浮盈等一次性收益，看主业赚不赚钱',
+        '占比越低，利润越依赖非经常性收益，含金量越低')
+
+    gm = (rev - cost) / rev if (rev and cost) else None
+    add('毛利率', pct(gm), '与同行/历史比', '卖100块剩多少毛利，反映定价权',
+        '毛利率趋势比绝对值重要；与同行对比看行业地位')
+
+    ncfr = netcf / npm if (netcf and npm) else None
+    add('现净比(经营现金流/净利)', f'{ncfr:.2f}' if ncfr is not None else '-',
+        '< 0.5 且连续 → 含金量警示', '利润是账面数，现金流才是真金白银',
+        '中报常季节性偏低，看全年口径与历史对照；连续低需警惕')
+
+    ct = ctr / rev if (ctr and rev) else None
+    add('合同负债/营收', pct(ct), '营收先行指标',
+        '客户提前打的钱，是未来营收的蓄水池', '下降说明后续可结算收入在变少')
+
+    ar = recv / rev if (recv and rev) else None
+    add('应收/营收', pct(ar), '> 30% 警戒',
+        '货发了货款收没收回，超三成说明赊账严重', '看趋势：单季暴增更要关注')
+
+    add('经营现金流', f'{netcf / 1e8:.1f} 亿' if netcf is not None else '-',
+        '常负 → 致命警示', '生意真正的造血能力',
+        '长期为负比亏损更致命；看历史是否稳定为正')
+
+    days = (inv / (cost / 6) * 30) if (inv and cost) else None
+    add('存货+周转天数', (f'{inv / 1e8:.0f} 亿 / {days:.0f} 天'
+                         if (inv is not None and days) else '-'),
+        '景气度温度计', '囤货要么是备货抢单，要么是卖不动',
+        '存货大+周转慢+营收降=滞销风险；存货大+合同负债涨=备货')
+
+    nm_ratio = npm / rev if (npm and rev) else None
+    tat = rev / assets * 2 if (rev and assets) else None
+    add('杜邦三拆',
+        (f'净利率 {nm_ratio * 100:.1f}% × 周转 {tat:.2f} × 杠杆 {lev:.2f}'
+         if (nm_ratio and tat and lev) else '-'),
+        '手艺 vs 借钱', '把ROE拆成净利率×周转率×杠杆率',
+        '净利率驱动=有定价权；周转驱动=效率型；杠杆驱动=风险型')
+
+    h = get_valuation_history(ths)
+    if h and h.get('pe'):
+        pe_q = h['pe']
+        cur = h.get('current_pe')
+        pos = ('>P90(历史高位)' if cur and cur >= pe_q[90]
+               else '<P10(历史低位)' if cur and cur <= pe_q[10] else '中位区间')
+        add('估值历史分位(近5年)', f"PE {cur} · {pos}", '分位越低越便宜',
+            '看现在价格在历史上算贵还是便宜',
+            f"P10={pe_q[10]} P50={pe_q[50]} P90={pe_q[90]}（近{h['years']}年）")
+
+    # ---- 异常信号(只摆数据, 给方向, 不替结论) ----
+    if dnp is not None and dnp < 0.6:
+        out['signals'].append({
+            'title': '归母 vs 扣非背离',
+            'data': f"扣非 {dnpm/1e8:.1f}亿 / 归母 {npm/1e8:.1f}亿 = 占比 {dnp*100:.0f}%",
+            'desc': '利润里约四成以上来自非经常性收益(投资收益/浮盈/补贴等)，'
+                    '这部分明年不一定重复出现。需你核实是彩蛋还是水分。'})
+    if (npm_yoy and rev_yoy and fixa_prev and fixa is not None
+            and fixa < fixa_prev and (npm_yoy - rev_yoy) > 20):
+        out['signals'].append({
+            'title': '折旧到期红利(疑似)',
+            'data': f"固定资产 {fixa_prev/1e8:.0f}亿→{fixa/1e8:.0f}亿，净利同比{npm_yoy:.1f}% vs 营收同比{rev_yoy:.1f}%",
+            'desc': '固定资产下降+利润增速明显快于收入，可能是老产线折旧到期'
+                    '(同样收入、折旧少了、利润自然冒出)，属周期爬坡的正常剧本，'
+                    '不是商业模式升级。请结合在建工程/产能核实。'})
+    holder = out['holder']
+    if len(holder) >= 2 and holder[0].get('ratio') is not None and holder[0]['ratio'] > 10:
+        out['signals'].append({
+            'title': '股东户数快速增加(筹码散户化)',
+            'data': f"股东户数 {holder[0]['num']/10000:.1f}万户，环比 {holder[0]['ratio']:+.1f}%",
+            'desc': '户数大增=筹码从机构流向散户，短期博弈资金变多、波动加大。'
+                    '是否好事需结合后续业绩判断。'})
+    if (netcf_prev is not None and netcf is not None and netcf < netcf_prev * 0.5
+            and recv_prev and recv is not None and recv > recv_prev * 1.3):
+        out['signals'].append({
+            'title': '经营现金流骤降 + 应收暴增',
+            'data': f"经营现金流 {netcf_prev/1e8:.0f}亿→{netcf/1e8:.0f}亿，"
+                    f"应收 {recv_prev/1e8:.0f}亿→{recv/1e8:.0f}亿",
+            'desc': '利润涨但现金流缩、钱变成欠条和库存，回款节奏放慢。'
+                    '若连续两三个季度净现比<0.5，需从季节性升级为含金量问题对待。'})
+
+    # ---- 防造假四检 ----
+    def add_fraud(name, data, verdict, desc):
+        out['fraud'].append({'name': name, 'data': data, 'verdict': verdict, 'desc': desc})
+
+    cash_r = cash / assets if (cash and assets) else None
+    debt_r = (short + long_loan) / assets if (assets and (short is not None)) else None
+    if cash_r and debt_r and cash_r > 0.15 and debt_r > 0.3:
+        add_fraud('① 存贷双高', f"货币资金占比{cash_r*100:.0f}%、有息负债占比{debt_r*100:.0f}%",
+                  '需关注', '账上钱多还借大额短债，是资金被挪用/体外循环的常见特征；'
+                          '但也可能是金融/资金密集型行业常态，需结合财务费用核实。')
+    else:
+        add_fraud('① 存贷双高',
+                  (f"货币资金占比{cash_r*100:.0f}%、有息负债占比{debt_r*100:.0f}%"
+                   if (cash_r and debt_r) else '数据不足'),
+                  '未命中', '未出现"现金多+短债多"组合。')
+
+    if (netcf is not None and npm is not None and ncfr is not None):
+        add_fraud('② 经营现金流 vs 净利匹配',
+                  f"经营现金流 {netcf/1e8:.1f}亿 vs 归母净利 {npm/1e8:.1f}亿，现净比 {ncfr:.2f}",
+                  ('需关注' if ncfr < 0.3 else '正常' if ncfr >= 0.6 else '中性'),
+                  '利润长期显著大于经营现金流且无法解释，可能是纸面利润；'
+                  '反之现金流>利润说明利润有真金白银支撑。')
+    if fincf is not None:
+        add_fraud('③ 筹资现金流依赖(输血/造血)',
+                  f"筹资现金流 {fincf/1e8:.1f}亿",
+                  '需关注(靠融资输血)' if fincf > 0 else '良性(在还债/派息)',
+                  '筹资现金流持续为正=靠外部输血；为负=造血后还债分红，较良性。')
+    g_ratio = good / assets if (good and assets) else None
+    if g_ratio is not None:
+        add_fraud('④ 商誉减值风险', f"商誉 {good/1e8:.1f}亿，占资产 {g_ratio*100:.2f}%",
+                  '需关注(占比高)' if g_ratio > 0.15 else '正常',
+                  '商誉占比高意味着收购溢价大，被收购方业绩不达标会计提减值、冲击利润。')
+
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='快速看财报: 总览 + 三表明细(同比/环比)',
