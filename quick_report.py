@@ -225,6 +225,75 @@ def get_valuations(thscode):
     return items[0] if items else None
 
 
+def _em_ttm(ep, ticker, field):
+    """东财F10 利润/现金流 TTM = 最近年报 + 最新累计 - 去年同期累计(累计口径)"""
+    rows = _em_fin(ep, ticker, dates=','.join(_recent_quarters(9)))
+    if not rows:
+        return None
+    by_key = {}
+    for r in rows:
+        d = str(r.get('REPORT_DATE') or '')[:10]
+        v = r.get(field)
+        if len(d) >= 7 and v is not None:
+            try:
+                by_key[(int(d[:4]), int(d[5:7]))] = float(v)
+            except (ValueError, TypeError):
+                pass
+    if not by_key:
+        return None
+    newest = max(by_key)
+    ly, lm = newest
+    fy = by_key.get((ly if lm == 12 else ly - 1, 12))
+    cur = by_key.get(newest)
+    prev = by_key.get((ly - 1, lm))
+    if fy is not None and cur is not None and prev is not None:
+        return round(fy + cur - prev, 2)
+    return fy
+
+
+def get_em_quote(ticker):
+    """东财单股行情(1请求, 免同花顺配额) → {snap, val}
+    snap: last_price/prev_price/open_price/high_price/low_price/turnover/price_change/price_change_ratio_pct
+    val: pe_ttm/pe_mrq/pb_mrq/ps_ttm/pcf_ttm/mcap (PS/PCF 用 F10 TTM 营收/经营现金流算)"""
+    t = str(ticker).strip().zfill(6)
+    secid = ('1.' if t.startswith(('6', '9')) else '0.') + t
+    fields = 'f43,f44,f45,f46,f47,f48,f60,f169,f170,f162,f163,f164,f167,f116'
+    try:
+        r = requests.get('https://push2delay.eastmoney.com/api/qt/stock/get',
+                         params={'secid': secid, 'fields': fields},
+                         headers={'User-Agent': EM_UA,
+                                  'Referer': 'https://quote.eastmoney.com/'},
+                         timeout=12)
+        d = (r.json() or {}).get('data') or {}
+    except Exception as e:
+        print(f'  [东财行情获取失败 {ticker}] {e}')
+        return None
+    if not d.get('f43') and not d.get('f116'):
+        return None
+
+    def px(v):
+        return round(float(v) / 100, 2) if isinstance(v, (int, float)) else None
+
+    snap = {'last_price': px(d.get('f43')), 'prev_price': px(d.get('f60')),
+            'open_price': px(d.get('f46')), 'high_price': px(d.get('f44')),
+            'low_price': px(d.get('f45')), 'turnover': d.get('f48'),
+            'price_change': px(d.get('f169')),
+            'price_change_ratio_pct': round(float(d.get('f170')) / 100, 2)
+            if isinstance(d.get('f170'), (int, float)) else None}
+    mcap = d.get('f116')
+    val = {'pe_ttm': px(d.get('f164')), 'pe_mrq': px(d.get('f162')),
+           'pb_mrq': px(d.get('f167')), 'ps_ttm': None, 'pcf_ttm': None,
+           'mcap': mcap}
+    if mcap:
+        rev_ttm = _em_ttm('Lrb', t, 'OPERATE_INCOME')
+        ocf_ttm = _em_ttm('Xjllb', t, 'NETCASH_OPERATE')
+        if rev_ttm:
+            val['ps_ttm'] = round(float(mcap) / rev_ttm, 2)
+        if ocf_ttm:
+            val['pcf_ttm'] = round(float(mcap) / ocf_ttm, 2)
+    return {'snap': snap, 'val': val}
+
+
 # ========== 3. 利润表分析(自动同比) ==========
 def get_income_analysis(thscode, limit=10):
     """返回 (rows, cur_key, prev_key, err)
@@ -1665,8 +1734,8 @@ def build_financial_checkup(ticker):
     netcf = f(c.get('NETCASH_OPERATE'))
     fincf = f(c.get('NETCASH_FINANCE'))
     dv = get_dividend_history(ticker)
-    _snap = get_snapshot(ths)
-    _price = (_snap or {}).get('last_price')
+    _q = get_em_quote(ticker) or {}
+    _price = (_q.get('snap') or {}).get('last_price')
     dy = dividend_yield_pct(dv, _price)
     cash = f(b.get('MONETARYFUNDS'))
     short = (f(b.get('SHORT_LOAN')) or 0) + (f(b.get('NONCURRENT_LIAB_1YEAR')) or 0)

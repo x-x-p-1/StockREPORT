@@ -20,6 +20,7 @@ Streamlit 对取数做了缓存（避开同花顺调用配额）。
 
 import re
 import sys
+import threading
 from pathlib import Path
 
 import streamlit as st
@@ -60,13 +61,9 @@ def cached_resolve(q):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cached_snapshot(ths):
-    return qr.get_snapshot(ths)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_valuations(ths):
-    return qr.get_valuations(ths)
+def cached_quote(ticker):
+    """东财单股行情(现价+PE/PB/PS/PCF/市值), 1请求免同花顺配额 → {snap, val}"""
+    return qr.get_em_quote(ticker)
 
 
 # 缓存策略: 慢且稳定的数据 → persist="disk"(磁盘持久化, 重启服务也保留) + 24h TTL;
@@ -396,11 +393,17 @@ def render_radar(scores):
     st.plotly_chart(fig, width='stretch')
 
 
+# ---- 处理「跳转到某公司」请求(必须在对应 widget 实例化前设置, 否则报错) ----
+_pending = st.session_state.pop('_pending_search', None)
+if _pending:
+    st.session_state['search_q'] = _pending
+    st.session_state['main_tab'] = st.session_state.pop('_pending_tab', '🩺 财报体检 Checkup')
+
 # ========== 侧边栏 ==========
 with st.sidebar:
     st.title(APP_TITLE)
     st.caption(APP_HINT)
-    q = st.text_input('🔍 股票代码或名称', value='中国移动')
+    q = st.text_input('🔍 股票代码或名称', value='中国移动', key='search_q')
     limit = st.slider('历史期数', min_value=2, max_value=20,
                       value=int(qr.cfg_get('default_periods', 8)), step=1)
     go_btn = st.button('查询', type='primary', use_container_width=True)
@@ -415,6 +418,26 @@ with st.spinner('正在拉取数据...'):
 if err or not ths:
     st.error(f'未找到标的：{q}')
     st.stop()
+
+# ---- 后台预热: 查询后异步预取慢数据, 让其它 Tab 秒开(每股只跑一次) ----
+def _warm_cache(ticker, ths):
+    import time as _t
+    _t.sleep(0.8)          # 让首屏(总览)先渲染, 避免抢同花顺配额
+    try:
+        cached_val_history(ths)
+        cached_checkup(ticker, _v=2)
+        cached_main_business(ths)
+        cached_dividend(ticker)
+        cached_concept_boards(ticker)
+        cached_reports(ticker)
+    except Exception:
+        pass
+
+if 'warmed' not in st.session_state:
+    st.session_state['warmed'] = set()
+if name not in st.session_state['warmed']:
+    st.session_state['warmed'].add(name)
+    threading.Thread(target=_warm_cache, args=(ticker, ths), daemon=True).start()
 
 # ========== 主体：Tab 布局 ==========
 st.title(f'{name}  ({ths})')
@@ -433,7 +456,9 @@ st.caption('⚡ 懒加载：只取当前页签数据，切换秒开；其余页�
 
 # ---------- Tab1 总览 Overview ----------
 if cur_tab == '📋 总览 Overview':
-    snap = cached_snapshot(ths)
+    _q = cached_quote(ticker)
+    snap = (_q or {}).get('snap')
+    val = (_q or {}).get('val')
     if snap:
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric('最新价 Last', qr.fmt_num(snap.get('last_price')),
@@ -444,7 +469,6 @@ if cur_tab == '📋 总览 Overview':
         c5.metric('成交额 Turnover', qr.fmt_yi(snap.get('turnover')))
         c6.metric('数据时间 Time', qr.datetime.now().strftime('%H:%M'))
 
-    val = cached_valuations(ths)
     if val:
         st.subheader('估值 Valuation')
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -708,6 +732,21 @@ if cur_tab == '📰 券商研报 Research':
                     st.caption('「近90天研报」= 近90天被券商覆盖篇数（覆盖越多 = 产业研报越关注）；'
                                '「评级分布」= 买入/增持/持有篇数。数据源：东财研报（板块市值前20成分股）。'
                                '只摆研报覆盖与评级，结论请自行判断')
+                    # ---- 点公司 → 跳转到该股票分析 ----
+                    jopts = [f"{h['name']} ({h['code']})" for h in hot if h.get('code')]
+                    if jopts:
+                        cj1, cj2 = st.columns([3, 2])
+                        with cj1:
+                            jp = st.selectbox('🔎 选中一家公司，直接跳到它的分析', jopts, key='rev_jump')
+                        with cj2:
+                            st.write('')
+                            if st.button('🚀 打开这家公司（财报体检）', type='primary',
+                                         use_container_width=True):
+                                code = jp.split('(')[-1].rstrip(')')
+                                st.session_state['_pending_search'] = code
+                                st.session_state['_pending_tab'] = '🩺 财报体检 Checkup'
+                                st.session_state.pop('rev_kw', None)
+                                st.rerun()
 
 # ---------- Tab7 因子画像（大师关注点 → A股因子 总结） ----------
 if cur_tab == '🧬 因子画像 Factor Profile':
@@ -718,7 +757,7 @@ if cur_tab == '🧬 因子画像 Factor Profile':
     inc = ((cached_statement(ths, 'income', flimit).get('data') or {}).get('item', []))
     bal = ((cached_statement(ths, 'balance', flimit).get('data') or {}).get('item', []))
     csh = ((cached_statement(ths, 'cashflow', flimit).get('data') or {}).get('item', []))
-    val = cached_valuations(ths)
+    val = (cached_quote(ticker) or {}).get('val')
     # 同业参照: 用第一个精准概念板块的成分股中位数(需 pe/pb)
     peer = None
     boards = cached_concept_boards(ticker)
@@ -786,7 +825,7 @@ if cur_tab == '🧮 估值判断 Valuation':
 
         # ---- ① 横向: 本股 vs 板块估值分布 ----
         stats = cached_board_valuation(bc)
-        val = cached_valuations(ths)
+        val = (cached_quote(ticker) or {}).get('val')
         if stats and val:
             pe_s, pb_s = stats.get('pe'), stats.get('pb')
             cur_pe, cur_pb = val.get('pe_ttm'), val.get('pb_mrq')
